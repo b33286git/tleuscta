@@ -1,0 +1,5053 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<title>🐱 貓咪的冒險</title>
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="貓咪的冒險">
+<meta name="theme-color" content="#0a0a1f">
+
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none; user-select: none;
+  -webkit-touch-callout: none; }
+html, body { width: 100%; height: 100%; overflow: hidden;
+  background: #0a0a1f;
+  font-family: -apple-system, "PingFang TC", sans-serif;
+  touch-action: none; }
+#game-canvas { display: block; width: 100vw; height: 100vh;
+  image-rendering: pixelated; image-rendering: crisp-edges; }
+#loading { position: fixed; inset: 0;
+  display: flex; align-items: center; justify-content: center; flex-direction: column;
+  background: #0a0a1f; color: #fff; z-index: 100;
+  transition: opacity 0.6s; }
+#loading.hidden { opacity: 0; pointer-events: none; }
+#loading .cat { font-size: 64px; animation: breathe 1.6s ease-in-out infinite; }
+#loading .text { margin-top: 16px; font-size: 14px; letter-spacing: 4px; opacity: 0.7; }
+@keyframes breathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.15); } }
+#debug { position: fixed; top: 8px; left: 8px;
+  color: #fff8; font-size: 11px; font-family: ui-monospace, monospace;
+  pointer-events: none; z-index: 50; }
+#parent-mode { position: fixed; top: 12px; right: 12px;
+  width: 44px; height: 44px;
+  background: rgba(255,255,255,0.1);
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 22px;
+  color: #fff; font-size: 20px;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; z-index: 40;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  transition: all 0.2s; }
+#parent-mode:active { transform: scale(0.92); }
+#parent-mode.on { background: rgba(255, 215, 0, 0.3); border-color: rgba(255, 215, 0, 0.6); }
+</style>
+</head>
+<body>
+<div id="loading"><div class="cat">🐱</div><div class="text">準備中...</div></div>
+<canvas id="game-canvas"></canvas>
+<button id="parent-mode" title="家長模式">⚙️</button>
+<div id="debug">FPS: -- | Stage: 2</div>
+
+<script>
+'use strict';
+
+/* ============================================================
+   🛠️ 工具
+   ============================================================ */
+const Easing = {
+  easeOutCubic: t => 1 - Math.pow(1 - t, 3),
+  easeInOutCubic: t => t < 0.5 ? 4*t*t*t : 1 - Math.pow(-2*t + 2, 3) / 2,
+  easeOutBack: t => { const c1=1.70158, c3=c1+1; return 1+c3*Math.pow(t-1,3)+c1*Math.pow(t-1,2); },
+  easeOutElastic: t => {
+    const c4 = (2 * Math.PI) / 3;
+    return t === 0 ? 0 : t === 1 ? 1
+      : Math.pow(2, -10*t) * Math.sin((t*10-0.75) * c4) + 1;
+  },
+};
+
+class Tween {
+  constructor(from, to, duration, easing = Easing.easeOutCubic, onDone = null) {
+    this.from = from; this.to = to;
+    this.duration = duration; this.easing = easing;
+    this.elapsed = 0; this.done = false; this.onDone = onDone;
+  }
+  update(dt) {
+    if (this.done) return this.to;
+    this.elapsed += dt;
+    const t = Math.min(this.elapsed / this.duration, 1);
+    const v = this.from + (this.to - this.from) * this.easing(t);
+    if (t >= 1) { this.done = true; if (this.onDone) this.onDone(); }
+    return v;
+  }
+}
+
+/* ============================================================
+   🎮 遊戲核心
+   ============================================================ */
+const Game = {
+  canvas: null, ctx: null,
+  width: 0, height: 0, dpr: 1,
+  lastTime: 0, fps: 0, frames: 0, fpsTimer: 0,
+  currentScene: null,
+  progress: {
+    fire: false, water: false, forest: false, ice: false,
+    fireLevel: 0, waterLevel: 0, forestLevel: 0, iceLevel: 0,
+  },
+  parentMode: false,
+
+  init() {
+    this.canvas = document.getElementById('game-canvas');
+    this.ctx = this.canvas.getContext('2d');
+    this.resize();
+    window.addEventListener('resize', () => this.resize());
+    window.addEventListener('orientationchange', () => setTimeout(() => this.resize(), 100));
+
+    try {
+      const saved = localStorage.getItem('cat-adventure-progress');
+      if (saved) this.progress = { ...this.progress, ...JSON.parse(saved) };
+      this.parentMode = localStorage.getItem('cat-adventure-parent') === '1';
+    } catch (e) {}
+    this.updateParentBtn();
+
+    const handleTap = (e) => {
+      e.preventDefault();
+      const t = e.touches ? e.touches[0] : e;
+      const rect = this.canvas.getBoundingClientRect();
+      const x = t.clientX - rect.left;
+      const y = t.clientY - rect.top;
+      if (this.currentScene && this.currentScene.onTap) {
+        this.currentScene.onTap(x, y);
+      }
+    };
+    this.canvas.addEventListener('click', handleTap);
+    this.canvas.addEventListener('touchstart', handleTap, { passive: false });
+
+    document.getElementById('parent-mode').addEventListener('click', () => {
+      this.parentMode = !this.parentMode;
+      localStorage.setItem('cat-adventure-parent', this.parentMode ? '1' : '0');
+      this.updateParentBtn();
+    });
+
+    this.changeScene(new WorldMapScene());
+    requestAnimationFrame((t) => this.loop(t));
+    setTimeout(() => document.getElementById('loading').classList.add('hidden'), 600);
+  },
+
+  updateParentBtn() {
+    const btn = document.getElementById('parent-mode');
+    btn.classList.toggle('on', this.parentMode);
+    btn.textContent = this.parentMode ? '🧑‍🏫' : '⚙️';
+    btn.title = this.parentMode ? '家長模式：開' : '家長模式：關';
+  },
+
+  saveProgress() {
+    localStorage.setItem('cat-adventure-progress', JSON.stringify(this.progress));
+  },
+
+  resize() {
+    this.dpr = window.devicePixelRatio || 1;
+    this.width = window.innerWidth;
+    this.height = window.innerHeight;
+    this.canvas.width = this.width * this.dpr;
+    this.canvas.height = this.height * this.dpr;
+    this.canvas.style.width = this.width + 'px';
+    this.canvas.style.height = this.height + 'px';
+    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    this.ctx.imageSmoothingEnabled = false;
+    if (this.currentScene && this.currentScene.onResize) {
+      this.currentScene.onResize();
+    }
+  },
+
+  loop(currentTime) {
+    const dt = Math.min((currentTime - this.lastTime) / 1000, 0.05);
+    this.lastTime = currentTime;
+    this.frames++; this.fpsTimer += dt;
+    if (this.fpsTimer >= 1) {
+      this.fps = this.frames; this.frames = 0; this.fpsTimer = 0;
+      const sceneName = this.currentScene ? this.currentScene.name || '?' : '?';
+      document.getElementById('debug').textContent =
+        `FPS: ${this.fps} | ${sceneName} | ${this.width}×${this.height}`;
+    }
+    if (this.currentScene) {
+      this.currentScene.update(dt);
+      this.currentScene.draw(this.ctx);
+    }
+    requestAnimationFrame((t) => this.loop(t));
+  },
+
+  changeScene(scene) {
+    this.currentScene = scene;
+    if (scene.enter) scene.enter();
+  },
+};
+
+/* ============================================================
+   🐱 像素虎紋貓
+   ============================================================ */
+const CAT_SPRITES = {
+  idle: [
+    "...BB......BBBB......BB.",
+    "..BWWB....BWWWWB....BWWB",
+    "..BWBWB..BWBWBWB...BWBWB",
+    "..BWWWB..BWWWWWB...BWWWB",
+    "...BWWBBBWWWWWWWBBBBWWB.",
+    "....BWWWWWWWWWWWWWWWWB..",
+    "....BWGWBBBWWWBBBWGWB...",
+    "....BWGWBPPBWBPPBWGWB...",
+    "....BWWWBBBPWPBBBWWWB...",
+    "....BWWWWWWWWWWWWWWWB...",
+    "....BBWWBBBWWWBBBWWBB...",
+    ".....BWWWWWBBWWWWWWB....",
+    ".....BWBWBWBWBWBWBWB....",
+    ".....BWWWBWWWBWWWWBB....",
+    "....BBWWBBBWWWBBBWWB....",
+    "...BWWB..BWB.BWB..BWWB..",
+    "...BWWB..BWB.BWB..BWWB..",
+    "....BB....BB...BB...BB..",
+  ],
+  idle2: [
+    "...BB......BBBB......BB.",
+    "..BWWB....BWWWWB....BWWB",
+    "..BWBWB..BWBWBWB...BWBWB",
+    "..BWWWB..BWWWWWB...BWWWB",
+    "...BWWBBBWWWWWWWBBBBWWB.",
+    "....BWWWWWWWWWWWWWWWWB..",
+    "....BWGWBBBWWWBBBWGWB...",
+    "....BWGWBPPBWBPPBWGWB...",
+    "....BWWWBBBPWPBBBWWWB...",
+    "....BWWWWWWWWWWWWWWWB...",
+    "....BBWWBBBWWWBBBWWBB...",
+    ".....BWWWWWBBWWWWWWB.BB.",
+    ".....BWBWBWBWBWBWBWBBWWB",
+    ".....BWWWBWWWBWWWWBBBWWB",
+    "....BBWWBBBWWWBBBWWBBBB.",
+    "...BWWB..BWB.BWB..BWWB..",
+    "...BWWB..BWB.BWB..BWWB..",
+    "....BB....BB...BB...BB..",
+  ],
+  blink: [
+    "...BB......BBBB......BB.",
+    "..BWWB....BWWWWB....BWWB",
+    "..BWBWB..BWBWBWB...BWBWB",
+    "..BWWWB..BWWWWWB...BWWWB",
+    "...BWWBBBWWWWWWWBBBBWWB.",
+    "....BWWWWWWWWWWWWWWWWB..",
+    "....BWWWBBBWWWBBBWWWB...",
+    "....BBBBBPPBWBPPBBBBB...",
+    "....BWWWBBBPWPBBBWWWB...",
+    "....BWWWWWWWWWWWWWWWB...",
+    "....BBWWBBBWWWBBBWWBB...",
+    ".....BWWWWWBBWWWWWWB....",
+    ".....BWBWBWBWBWBWBWB....",
+    ".....BWWWBWWWBWWWWBB....",
+    "....BBWWBBBWWWBBBWWB....",
+    "...BWWB..BWB.BWB..BWWB..",
+    "...BWWB..BWB.BWB..BWWB..",
+    "....BB....BB...BB...BB..",
+  ],
+  // 走路1（右腳前）
+  walk1: [
+    "...BB......BBBB......BB.",
+    "..BWWB....BWWWWB....BWWB",
+    "..BWBWB..BWBWBWB...BWBWB",
+    "..BWWWB..BWWWWWB...BWWWB",
+    "...BWWBBBWWWWWWWBBBBWWB.",
+    "....BWWWWWWWWWWWWWWWWB..",
+    "....BWGWBBBWWWBBBWGWB...",
+    "....BWGWBPPBWBPPBWGWB...",
+    "....BWWWBBBPWPBBBWWWB...",
+    "....BWWWWWWWWWWWWWWWB...",
+    "....BBWWBBBWWWBBBWWBB...",
+    ".....BWWWWWBBWWWWWWB....",
+    ".....BWBWBWBWBWBWBWB....",
+    ".....BWWWBWWWBWWWWBB....",
+    "....BBWWBBBWWWBBBWWB....",
+    "...BWWB...BWWB....BWWB..",
+    "....BWWB..BWWB.....BWWB.",
+    ".....BB....BB.......BB..",
+  ],
+  // 走路2（左腳前）
+  walk2: [
+    "...BB......BBBB......BB.",
+    "..BWWB....BWWWWB....BWWB",
+    "..BWBWB..BWBWBWB...BWBWB",
+    "..BWWWB..BWWWWWB...BWWWB",
+    "...BWWBBBWWWWWWWBBBBWWB.",
+    "....BWWWWWWWWWWWWWWWWB..",
+    "....BWGWBBBWWWBBBWGWB...",
+    "....BWGWBPPBWBPPBWGWB...",
+    "....BWWWBBBPWPBBBWWWB...",
+    "....BWWWWWWWWWWWWWWWB...",
+    "....BBWWBBBWWWBBBWWBB...",
+    ".....BWWWWWBBWWWWWWB....",
+    ".....BWBWBWBWBWBWBWB....",
+    ".....BWWWBWWWBWWWWBB....",
+    "....BBWWBBBWWWBBBWWB....",
+    "...BWWWB.BWB..BWWB.BWWB.",
+    "...BWWWB.BWB..BWWB.BWWB.",
+    "....BB....BB...BB...BB..",
+  ],
+  // 開心舉手慶祝
+  cheer: [
+    ".BWB.......BBBB.......BWB",
+    "BWWWB.....BWWWWB.....BWWWB",
+    "BWBWB....BWBWBWB....BWBWB.",
+    "BWWWB....BWWWWWB....BWWWB.",
+    ".BWWBBBBBWWWWWWWBBBBBBWB..",
+    "..BWWWWWWWWWWWWWWWWWWWB...",
+    "..BWGWBBBBWW^WWBBBBWGWB...",
+    "..BWGWBPPBW^^^WBPPBWGWB...",
+    "..BWWWBBBP^^W^^PBBBWWWB...",
+    "..BWWWWWWWWWWWWWWWWWWWB...",
+    "..BBWWBBBWWWWWWWBBBWWBB...",
+    "...BWWWWWWBBWWWWWWWWB.....",
+    "...BWBWBWBWBWBWBWBWB......",
+    "...BWWWBWWWBWWWWWWBB......",
+    "..BBWWBBBWWWBWWBBBWWB.....",
+    ".BWWB...BWB..BWB..BWWB....",
+    ".BWWB...BWB..BWB..BWWB....",
+    "..BB.....BB...BB...BB.....",
+  ],
+};
+
+const PIXEL_COLORS = {
+  B: '#1a1a1a', W: '#f5f5f0',
+  P: '#ff8fa0', G: '#2dc653',
+  '^': '#ffeb3b', // 慶祝表情
+};
+
+class PixelCat {
+  constructor(x, y) {
+    this.x = x; this.y = y;
+    this.scale = 4;
+    this.bobTime = 0; this.tailTime = 0;
+    this.blinkTimer = 0; this.isBlinking = false;
+    this.state = 'idle'; // idle / walk / cheer
+    this.flipX = false;
+  }
+  update(dt) {
+    this.bobTime += dt; this.tailTime += dt;
+    this.blinkTimer += dt;
+    if (this.blinkTimer > 3 + Math.random() * 2) {
+      this.isBlinking = true;
+      setTimeout(() => { this.isBlinking = false; this.blinkTimer = 0; }, 150);
+      this.blinkTimer = 0;
+    }
+  }
+  setState(state) { this.state = state; }
+  draw(ctx) {
+    let sprite;
+    if (this.state === 'cheer') sprite = CAT_SPRITES.cheer;
+    else if (this.state === 'walk') {
+      sprite = Math.floor(this.tailTime * 6) % 2 === 0 ? CAT_SPRITES.walk1 : CAT_SPRITES.walk2;
+    } else {
+      sprite = this.isBlinking ? CAT_SPRITES.blink
+        : (Math.floor(this.tailTime * 2) % 2 === 0 ? CAT_SPRITES.idle : CAT_SPRITES.idle2);
+    }
+
+    const bobOffset = this.state === 'walk'
+      ? Math.abs(Math.sin(this.tailTime * 12)) * 3
+      : Math.sin(this.bobTime * 2) * 2;
+    const px = this.scale;
+    const w = sprite[0].length;
+    const h = sprite.length;
+    const startX = this.x - (w * px) / 2;
+    const startY = this.y - h * px - bobOffset;
+
+    // 影子
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.beginPath();
+    ctx.ellipse(this.x, this.y - 2, w * px * 0.32, 5, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.save();
+    if (this.flipX) {
+      ctx.translate(this.x, 0);
+      ctx.scale(-1, 1);
+      ctx.translate(-this.x, 0);
+    }
+    for (let row = 0; row < h; row++) {
+      for (let col = 0; col < w; col++) {
+        const ch = sprite[row][col];
+        if (ch === '.' || !PIXEL_COLORS[ch]) continue;
+        ctx.fillStyle = PIXEL_COLORS[ch];
+        ctx.fillRect(startX + col * px, startY + row * px, px, px);
+      }
+    }
+    ctx.restore();
+  }
+}
+
+/* ============================================================
+   🏝️ 大陸（世界地圖用）
+   ============================================================ */
+class Continent {
+  constructor(config) {
+    Object.assign(this, config);
+    this.bobOffset = Math.random() * Math.PI * 2;
+    this.bobAmp = 8 + Math.random() * 4;
+    this.time = 0;
+    this.particles = [];
+    this.fogParticles = [];
+    for (let i = 0; i < 25; i++) {
+      this.fogParticles.push({
+        x: (Math.random()-0.5)*200, y: (Math.random()-0.5)*100,
+        size: 20+Math.random()*30, speed: 0.3+Math.random()*0.5,
+        alpha: 0.15+Math.random()*0.25,
+      });
+    }
+    for (let i = 0; i < 12; i++) {
+      this.particles.push({
+        x: (Math.random()-0.5)*120, y: (Math.random()-0.5)*60,
+        vy: -0.5-Math.random(), size: 1+Math.random()*2,
+        life: Math.random(),
+      });
+    }
+  }
+  get isCleared() { return Game.progress[this.id]; }
+
+  update(dt) {
+    this.time += dt;
+    for (const p of this.fogParticles) {
+      p.x += p.speed * dt * 10;
+      if (p.x > 120) p.x = -120;
+    }
+    for (const p of this.particles) {
+      p.life += dt * 0.5;
+      p.y += p.vy;
+      if (p.life > 1) { p.life = 0; p.x = (Math.random()-0.5)*120; p.y = 30; }
+    }
+  }
+  hitTest(px, py) {
+    const dx = px - this.x;
+    const dy = py - (this.y + Math.sin(this.time*1.2 + this.bobOffset) * this.bobAmp);
+    return dx*dx + dy*dy < 90*90;
+  }
+  draw(ctx) {
+    const yOff = Math.sin(this.time*1.2 + this.bobOffset) * this.bobAmp;
+    const cx = this.x, cy = this.y + yOff;
+
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    ctx.beginPath();
+    ctx.ellipse(cx, cy + 75, 95, 18, 0, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(cx-25, cy+80, 60, 12, 0, 0, Math.PI*2); ctx.fill();
+
+    ctx.fillStyle = this.accent;
+    ctx.beginPath();
+    ctx.moveTo(cx-70, cy+20); ctx.lineTo(cx+70, cy+20);
+    ctx.lineTo(cx+45, cy+65); ctx.lineTo(cx-45, cy+65);
+    ctx.closePath(); ctx.fill();
+
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy+15, 80, 30, 0, 0, Math.PI*2); ctx.fill();
+
+    this.drawTheme(ctx, cx, cy);
+
+    if (!this.isCleared) {
+      for (const p of this.fogParticles) {
+        const g = ctx.createRadialGradient(cx+p.x, cy+p.y, 0, cx+p.x, cy+p.y, p.size);
+        g.addColorStop(0, `rgba(180,180,200,${p.alpha})`);
+        g.addColorStop(1, 'rgba(180,180,200,0)');
+        ctx.fillStyle = g;
+        ctx.fillRect(cx+p.x-p.size, cy+p.y-p.size, p.size*2, p.size*2);
+      }
+    } else {
+      // 已破關：閃亮星星
+      for (let i = 0; i < 5; i++) {
+        const a = (this.time * 2 + i) % (Math.PI * 2);
+        const r = 60 + Math.sin(a * 0.5) * 10;
+        const sx = cx + Math.cos(a) * r;
+        const sy = cy + 15 + Math.sin(a) * 25;
+        ctx.fillStyle = `rgba(255,215,0,${0.6 + Math.sin(this.time*4+i)*0.4})`;
+        ctx.fillRect(sx, sy, 2, 2);
+      }
+    }
+
+    ctx.save();
+    ctx.font = 'bold 16px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.shadowColor = 'rgba(0,0,0,0.6)';
+    ctx.shadowBlur = 6;
+    ctx.fillStyle = this.isCleared ? '#ffd700' : 'rgba(255,255,255,0.7)';
+    const label = this.isCleared ? `✨ ${this.name} ✨` : `${this.emoji} ${this.name}`;
+    ctx.fillText(label, cx, cy + 100);
+    ctx.restore();
+  }
+  drawTheme(ctx, cx, cy) {
+    switch (this.type) {
+      case 'fire':
+        ctx.fillStyle = '#3a1810';
+        ctx.beginPath();
+        ctx.moveTo(cx-35, cy+5); ctx.lineTo(cx, cy-50); ctx.lineTo(cx+35, cy+5);
+        ctx.closePath(); ctx.fill();
+        ctx.fillStyle = '#ff5722';
+        ctx.beginPath(); ctx.ellipse(cx, cy-48, 12, 5, 0, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#ffeb3b';
+        ctx.beginPath(); ctx.ellipse(cx, cy-49, 6, 2.5, 0, 0, Math.PI*2); ctx.fill();
+        for (const p of this.particles) {
+          const a = 1 - p.life;
+          ctx.fillStyle = `rgba(255, ${Math.floor(150+p.life*100)}, 50, ${a})`;
+          ctx.fillRect(cx+p.x*0.3, cy-50+p.y, p.size, p.size);
+        }
+        break;
+      case 'water':
+        ctx.fillStyle = '#1e88e5';
+        ctx.beginPath(); ctx.ellipse(cx, cy+5, 60, 14, 0, 0, Math.PI*2); ctx.fill();
+        for (let i = 0; i < 3; i++) {
+          const wx = cx + Math.sin(this.time*2 + i) * 30;
+          ctx.fillStyle = 'rgba(255,255,255,0.5)';
+          ctx.fillRect(wx, cy+2, 8, 1);
+        }
+        ctx.fillStyle = '#5d4037'; ctx.fillRect(cx-22, cy-25, 4, 25);
+        ctx.fillStyle = '#43a047';
+        ctx.beginPath(); ctx.arc(cx-20, cy-28, 12, 0, Math.PI*2); ctx.fill();
+        for (const p of this.particles) {
+          if (p.y < 0) continue;
+          ctx.fillStyle = `rgba(100,200,255,${1-p.life})`;
+          ctx.fillRect(cx+p.x*0.4, cy+p.y*0.5, 2, 4);
+        }
+        break;
+      case 'forest':
+        ctx.fillStyle = '#5d4037'; ctx.fillRect(cx-4, cy-30, 8, 35);
+        ctx.fillStyle = '#2e7d32';
+        ctx.beginPath(); ctx.arc(cx, cy-35, 22, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#43a047';
+        ctx.beginPath(); ctx.arc(cx-12, cy-30, 14, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(cx+12, cy-30, 14, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#fff'; ctx.fillRect(cx-25, cy+5, 4, 6); ctx.fillRect(cx+22, cy+8, 3, 5);
+        ctx.fillStyle = '#e53935';
+        ctx.beginPath(); ctx.arc(cx-23, cy+4, 4, Math.PI, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(cx+23, cy+7, 3.5, Math.PI, Math.PI*2); ctx.fill();
+        for (const p of this.particles) {
+          ctx.fillStyle = `rgba(76,175,80,${0.5+p.life*0.5})`;
+          ctx.fillRect(cx+p.x*0.3+Math.sin(p.life*6)*3, cy-20+p.y, 3, 2);
+        }
+        break;
+      case 'ice':
+        ctx.fillStyle = '#bbdefb';
+        ctx.beginPath();
+        ctx.moveTo(cx-30, cy+5); ctx.lineTo(cx-10, cy-40);
+        ctx.lineTo(cx+5, cy-25); ctx.lineTo(cx+25, cy-45); ctx.lineTo(cx+35, cy+5);
+        ctx.closePath(); ctx.fill();
+        ctx.fillStyle = 'rgba(255,255,255,0.6)';
+        ctx.beginPath();
+        ctx.moveTo(cx-10, cy-40); ctx.lineTo(cx-5, cy-35);
+        ctx.lineTo(cx-5, cy+5); ctx.lineTo(cx-12, cy+5);
+        ctx.closePath(); ctx.fill();
+        for (const p of this.particles) {
+          ctx.fillStyle = `rgba(255,255,255,${1-p.life})`;
+          const sx = cx+p.x*0.3+Math.sin(p.life*4)*4;
+          const sy = cy-30+p.y*1.5;
+          ctx.fillRect(sx, sy, 2, 2);
+        }
+        const ag = ctx.createLinearGradient(cx-50, cy-60, cx+50, cy-60);
+        ag.addColorStop(0, 'rgba(76,175,80,0)');
+        ag.addColorStop(0.5, 'rgba(129,199,132,0.3)');
+        ag.addColorStop(1, 'rgba(76,175,80,0)');
+        ctx.fillStyle = ag;
+        ctx.fillRect(cx-50, cy-70+Math.sin(this.time)*3, 100, 8);
+        break;
+    }
+  }
+}
+
+/* ============================================================
+   🌍 世界地圖場景
+   ============================================================ */
+class WorldMapScene {
+  constructor() {
+    this.name = 'WorldMap';
+    this.time = 0;
+    this.stars = []; this.clouds = []; this.continents = [];
+    this.cat = null;
+    this.zoomTween = null; this.zoomTarget = null;
+    this.cameraScale = 1; this.cameraX = 0; this.cameraY = 0;
+    this.transitioning = false; this.fadeAlpha = 0;
+  }
+  enter() {
+    for (let i = 0; i < 100; i++) {
+      this.stars.push({
+        x: Math.random(), y: Math.random()*0.6,
+        size: Math.random()*1.6+0.6,
+        twinkle: Math.random()*Math.PI*2,
+        speed: 1.5+Math.random()*2,
+      });
+    }
+    for (let i = 0; i < 6; i++) {
+      this.clouds.push({
+        x: Math.random(), y: 0.65+Math.random()*0.3,
+        speed: 0.005+Math.random()*0.01,
+        size: 70+Math.random()*50,
+        opacity: 0.1+Math.random()*0.15,
+      });
+    }
+    this.layoutContinents();
+    this.cat = new PixelCat(Game.width/2, Game.height/2 + 30);
+  }
+  onResize() { this.layoutContinents(); if (this.cat) { this.cat.x = Game.width/2; this.cat.y = Game.height/2 + 30; } }
+  layoutContinents() {
+    const W = Game.width, H = Game.height;
+    const cy = H * 0.4;
+    const spacing = Math.min(W * 0.22, 200);
+    const cx = W / 2;
+    this.continents = [
+      new Continent({ id:'fire', name:'火之大陸', emoji:'🔥', type:'fire',
+        x: cx - spacing*1.5, y: cy, color:'#8d4a1a', accent:'#5a2b0a' }),
+      new Continent({ id:'water', name:'水之大陸', emoji:'💧', type:'water',
+        x: cx - spacing*0.5, y: cy+30, color:'#1565c0', accent:'#0d47a1' }),
+      new Continent({ id:'forest', name:'森林大陸', emoji:'🌿', type:'forest',
+        x: cx + spacing*0.5, y: cy+30, color:'#388e3c', accent:'#1b5e20' }),
+      new Continent({ id:'ice', name:'冰之大陸', emoji:'❄️', type:'ice',
+        x: cx + spacing*1.5, y: cy, color:'#90caf9', accent:'#42a5f5' }),
+    ];
+  }
+  onTap(x, y) {
+    if (this.transitioning) return;
+    const realX = (x - this.cameraX) / this.cameraScale;
+    const realY = (y - this.cameraY) / this.cameraScale;
+    for (const c of this.continents) {
+      if (c.hitTest(realX, realY)) { this.startZoomTo(c); return; }
+    }
+  }
+  startZoomTo(continent) {
+    this.transitioning = true;
+    this.zoomTarget = continent;
+    const targetScale = 3.5;
+    const targetX = Game.width/2 - continent.x * targetScale;
+    const targetY = Game.height/2 - continent.y * targetScale;
+    this.zoomTween = {
+      scale: new Tween(1, targetScale, 1.0, Easing.easeInOutCubic),
+      x: new Tween(0, targetX, 1.0, Easing.easeInOutCubic),
+      y: new Tween(0, targetY, 1.0, Easing.easeInOutCubic),
+      fade: new Tween(0, 1, 1.0, Easing.easeInOutCubic, () => {
+        this.enterContinent(continent);
+      }),
+    };
+  }
+  enterContinent(continent) {
+    if (continent.id === 'fire') {
+      Game.changeScene(new FireMapScene());
+    } else if (continent.id === 'water') {
+      Game.changeScene(new WaterMapScene());
+    } else if (continent.id === 'forest') {
+      Game.changeScene(new ForestMapScene());
+    } else if (continent.id === 'ice') {
+      Game.changeScene(new IceMapScene());
+    } else {
+      // 兜底
+      this.message = continent;
+      this.messageTimer = 2.5;
+      this.resetZoom();
+    }
+  }
+  resetZoom() {
+    this.zoomTween = {
+      scale: new Tween(this.cameraScale, 1, 0.7, Easing.easeOutCubic),
+      x: new Tween(this.cameraX, 0, 0.7, Easing.easeOutCubic),
+      y: new Tween(this.cameraY, 0, 0.7, Easing.easeOutCubic),
+      fade: new Tween(1, 0, 0.7, Easing.easeOutCubic, () => {
+        this.transitioning = false; this.zoomTarget = null;
+      }),
+    };
+  }
+  update(dt) {
+    this.time += dt;
+    for (const c of this.clouds) { c.x += c.speed*dt*5; if (c.x > 1.2) c.x = -0.2; }
+    for (const c of this.continents) c.update(dt);
+    this.cat.update(dt);
+    if (this.zoomTween) {
+      this.cameraScale = this.zoomTween.scale.update(dt);
+      this.cameraX = this.zoomTween.x.update(dt);
+      this.cameraY = this.zoomTween.y.update(dt);
+      this.fadeAlpha = this.zoomTween.fade.update(dt);
+    }
+    if (this.messageTimer > 0) {
+      this.messageTimer -= dt;
+      if (this.messageTimer <= 0) this.message = null;
+    }
+  }
+  draw(ctx) {
+    const W = Game.width, H = Game.height;
+    const sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, '#0a0a2f'); sky.addColorStop(0.4, '#1a1a4f');
+    sky.addColorStop(0.85, '#3a2a5f'); sky.addColorStop(1, '#5a3a6f');
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+
+    for (const s of this.stars) {
+      const a = 0.4 + Math.sin(this.time*s.speed + s.twinkle) * 0.4;
+      ctx.fillStyle = `rgba(255,255,220,${a})`;
+      ctx.fillRect(s.x*W, s.y*H, s.size, s.size);
+    }
+    ctx.fillStyle = 'rgba(255,248,208,0.25)';
+    ctx.beginPath(); ctx.arc(W*0.85, H*0.18, 50, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#fff8d0';
+    ctx.beginPath(); ctx.arc(W*0.85, H*0.18, 32, 0, Math.PI*2); ctx.fill();
+
+    for (const c of this.clouds) {
+      ctx.fillStyle = `rgba(255,255,255,${c.opacity})`;
+      const cx = c.x*W, cy = c.y*H;
+      ctx.beginPath();
+      ctx.arc(cx, cy, c.size*0.6, 0, Math.PI*2);
+      ctx.arc(cx+c.size*0.5, cy, c.size*0.5, 0, Math.PI*2);
+      ctx.arc(cx-c.size*0.5, cy, c.size*0.45, 0, Math.PI*2);
+      ctx.arc(cx+c.size*0.2, cy-c.size*0.3, c.size*0.4, 0, Math.PI*2);
+      ctx.fill();
+    }
+
+    ctx.save();
+    ctx.translate(this.cameraX, this.cameraY);
+    ctx.scale(this.cameraScale, this.cameraScale);
+    for (const c of this.continents) c.draw(ctx);
+    this.cat.draw(ctx);
+    ctx.restore();
+
+    if (this.cameraScale < 1.3) {
+      const ta = 1 - Math.max(0, (this.cameraScale-1)/0.3);
+      ctx.save();
+      ctx.globalAlpha = ta;
+      ctx.fillStyle = '#fff8d0';
+      ctx.font = 'bold 32px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center';
+      ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = 12;
+      ctx.fillText('🐱 貓咪的冒險', W/2, 60);
+      ctx.font = '14px -apple-system, "PingFang TC"';
+      ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.shadowBlur = 4;
+      ctx.fillText('點擊任一大陸開始冒險', W/2, 88);
+      ctx.restore();
+    }
+    if (this.fadeAlpha > 0) {
+      ctx.fillStyle = `rgba(0,0,0,${this.fadeAlpha*0.5})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+    if (this.message) {
+      const cardW = Math.min(360, W-60), cardH = 110;
+      const cx = (W-cardW)/2, cy = (H-cardH)/2;
+      ctx.fillStyle = 'rgba(20,20,40,0.92)';
+      ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(cx, cy, cardW, cardH, 18);
+      else ctx.rect(cx, cy, cardW, cardH);
+      ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#ffd700';
+      ctx.font = 'bold 22px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center';
+      ctx.fillText(`${this.message.emoji} ${this.message.name}`, W/2, cy + 45);
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.font = '14px -apple-system, "PingFang TC"';
+      ctx.fillText('未來階段開放，敬請期待！', W/2, cy + 75);
+    }
+  }
+}
+
+/* ============================================================
+   🔥 火之大陸關卡場景（階段 2 主角）
+   ============================================================ */
+class FireLevelScene {
+  constructor(levelNum) {
+    this.name = `Fire L${levelNum}`;
+    this.levelNum = levelNum;
+    this.time = 0;
+
+    // 場景元素
+    this.cat = null;
+    this.lavaParticles = [];     // 岩漿冒泡
+    this.smokeParticles = [];    // 火山煙
+    this.emberParticles = [];    // 飛濺火星
+    this.successParticles = [];  // 過關星星
+
+    // 道具系統
+    this.items = [
+      { id: 'wood', icon: '🪵', name: '木橋', x: 0, y: 0, used: false, hover: false },
+      { id: 'rock', icon: '🪨', name: '大石頭', x: 0, y: 0, used: false, hover: false },
+      { id: 'water', icon: '💧', name: '水桶', x: 0, y: 0, used: false, hover: false },
+    ];
+    this.selectedItem = null;
+
+    // 岩漿河
+    this.lavaState = 'normal';   // normal / wood-burning / rock-sinking / cooling / bridged
+    this.bridgeAlpha = 0;
+    this.lavaCooling = 0;        // 0~1，水變黑曜石的進度
+    this.feedbackText = null;
+    this.feedbackTimer = 0;
+    this.feedbackColor = '#fff';
+
+    // 過關
+    this.cleared = false;
+    this.catWalking = false;
+    this.catWalkTween = null;
+    this.showHintCard = false;
+    this.showWinCard = false;
+
+    // 失敗動畫
+    this.failingItem = null;     // 'wood' / 'rock'
+    this.failTime = 0;
+
+    // 進場 fade
+    this.enterAlpha = 1;
+    this.enterTween = new Tween(1, 0, 0.6, Easing.easeOutCubic);
+
+    // 返回按鈕
+    this.backBtn = { x: 50, y: 30, r: 22 };
+  }
+
+  enter() {
+    this.layout();
+    this.cat = new PixelCat(this.catStartX, this.groundY);
+    this.cat.scale = 3;
+
+    // 岩漿初始粒子
+    for (let i = 0; i < 30; i++) {
+      this.lavaParticles.push({
+        x: Math.random(),
+        y: Math.random(),
+        size: 1 + Math.random() * 2.5,
+        speed: 0.3 + Math.random() * 0.4,
+        offset: Math.random() * Math.PI * 2,
+      });
+    }
+    for (let i = 0; i < 15; i++) {
+      this.smokeParticles.push({
+        x: Math.random()*Game.width, y: Math.random()*Game.height*0.5,
+        size: 30+Math.random()*40, speed: 10+Math.random()*15,
+        alpha: 0.05+Math.random()*0.08,
+      });
+    }
+    for (let i = 0; i < 25; i++) {
+      this.emberParticles.push({
+        x: Math.random()*Game.width,
+        y: Game.height + Math.random()*100,
+        vy: -30-Math.random()*40,
+        life: Math.random(),
+        size: 1+Math.random()*2,
+      });
+    }
+  }
+
+  layout() {
+    const W = Game.width, H = Game.height;
+    this.groundY = H * 0.7;
+    this.lavaLeft = W * 0.32;
+    this.lavaRight = W * 0.68;
+    this.catStartX = W * 0.18;
+    this.catTargetX = W * 0.82;
+
+    // 道具放在底部
+    const itemY = H - 80;
+    const totalW = Math.min(W * 0.6, 360);
+    const startX = (W - totalW) / 2;
+    const step = totalW / 2;
+    this.items.forEach((it, i) => {
+      it.x = startX + i * step;
+      it.y = itemY;
+      it.r = 38;
+    });
+  }
+  onResize() { this.layout(); if (this.cat) { this.cat.x = this.catStartX; this.cat.y = this.groundY; } }
+
+  onTap(x, y) {
+    // 返回按鈕
+    const dx = x - this.backBtn.x, dy = y - this.backBtn.y;
+    if (dx*dx + dy*dy < this.backBtn.r * this.backBtn.r) {
+      Game.changeScene(new FireMapScene());
+      return;
+    }
+
+    // 過關卡片：再點任意處 → 回火之大陸地圖
+    if (this.showWinCard) {
+      Game.changeScene(new FireMapScene());
+      return;
+    }
+    // 提示小卡關閉
+    if (this.showHintCard) {
+      this.showHintCard = false;
+      return;
+    }
+
+    if (this.cleared || this.catWalking) return;
+
+    // 點道具
+    for (const it of this.items) {
+      if (it.used) continue;
+      const ddx = x - it.x, ddy = y - it.y;
+      if (ddx*ddx + ddy*ddy < it.r*it.r) {
+        this.useItem(it);
+        return;
+      }
+    }
+  }
+
+  useItem(item) {
+    item.used = true;
+
+    if (item.id === 'wood') {
+      this.lavaState = 'wood-burning';
+      this.failingItem = 'wood';
+      this.failTime = 0;
+      this.showFeedback('🔥 木橋被燒掉了！再試試別的吧～', '#ff7043');
+      setTimeout(() => {
+        item.used = false;  // 把木橋還給玩家
+        this.lavaState = 'normal';
+        this.failingItem = null;
+      }, 2200);
+    }
+    else if (item.id === 'rock') {
+      this.lavaState = 'rock-sinking';
+      this.failingItem = 'rock';
+      this.failTime = 0;
+      this.showFeedback('💦 石頭沉下去了！再想想～', '#ffb74d');
+      setTimeout(() => {
+        item.used = false;
+        this.lavaState = 'normal';
+        this.failingItem = null;
+      }, 2200);
+    }
+    else if (item.id === 'water') {
+      this.lavaState = 'cooling';
+      this.showFeedback('✨ 岩漿在冷卻... 變成黑曜石了！', '#4fc3f7');
+      // 1.2 秒後變橋
+      this.coolingTween = new Tween(0, 1, 1.2, Easing.easeInOutCubic, () => {
+        this.lavaState = 'bridged';
+        this.bridgeAlpha = 1;
+        // 虎紋貓開始走
+        setTimeout(() => this.startWalk(), 400);
+      });
+    }
+  }
+
+  startWalk() {
+    this.catWalking = true;
+    this.cat.setState('walk');
+    this.catWalkTween = new Tween(this.catStartX, this.catTargetX, 2.0, Easing.easeInOutCubic, () => {
+      this.cat.setState('cheer');
+      this.cleared = true;
+      this.catWalking = false;
+      // 觸發過關
+      Game.progress.fireLevel = Math.max(Game.progress.fireLevel || 0, 1);
+      Game.progress.fire = (Game.progress.fireLevel >= 2);
+      Game.saveProgress();
+      // 慶祝粒子
+      this.spawnSuccessParticles();
+      setTimeout(() => {
+        if (Game.parentMode) {
+          this.showHintCard = true;
+        } else {
+          this.showWinCard = true;
+        }
+      }, 1200);
+    });
+  }
+
+  spawnSuccessParticles() {
+    for (let i = 0; i < 40; i++) {
+      this.successParticles.push({
+        x: this.cat.x,
+        y: this.cat.y - 60,
+        vx: (Math.random()-0.5) * 200,
+        vy: -100 - Math.random()*150,
+        life: 0,
+        maxLife: 1.2 + Math.random()*0.6,
+        color: ['#ffd700', '#ffeb3b', '#ff5252', '#4fc3f7', '#fff'][Math.floor(Math.random()*5)],
+        size: 2 + Math.random()*2,
+      });
+    }
+  }
+
+  showFeedback(text, color) {
+    this.feedbackText = text;
+    this.feedbackColor = color;
+    this.feedbackTimer = 2.5;
+  }
+
+  update(dt) {
+    this.time += dt;
+    this.enterAlpha = this.enterTween.update(dt);
+    if (this.cat) this.cat.update(dt);
+
+    // 岩漿冷卻動畫
+    if (this.coolingTween && !this.coolingTween.done) {
+      this.lavaCooling = this.coolingTween.update(dt);
+    }
+
+    // 失敗動畫計時
+    if (this.failingItem) this.failTime += dt;
+
+    // 虎紋貓走路
+    if (this.catWalkTween && !this.catWalkTween.done) {
+      this.cat.x = this.catWalkTween.update(dt);
+    }
+
+    // 煙
+    for (const s of this.smokeParticles) {
+      s.x += s.speed * dt;
+      s.y -= s.speed * dt * 0.5;
+      if (s.y < -50 || s.x > Game.width+100) {
+        s.x = -50; s.y = Game.height*0.5 + Math.random()*100;
+      }
+    }
+    // 飛濺火星
+    for (const e of this.emberParticles) {
+      e.life += dt * 0.5;
+      e.y += e.vy * dt;
+      if (e.life > 1 || e.y < 0) {
+        e.life = 0;
+        e.x = Math.random() * Game.width;
+        e.y = Game.height + 20;
+      }
+    }
+    // 慶祝粒子
+    for (const p of this.successParticles) {
+      p.life += dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 200 * dt; // 重力
+    }
+    this.successParticles = this.successParticles.filter(p => p.life < p.maxLife);
+
+    // 提示文字倒數
+    if (this.feedbackTimer > 0) {
+      this.feedbackTimer -= dt;
+      if (this.feedbackTimer <= 0) this.feedbackText = null;
+    }
+  }
+
+  draw(ctx) {
+    const W = Game.width, H = Game.height;
+
+    // 🔥 火紅天空
+    const sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, '#1a0a05');
+    sky.addColorStop(0.4, '#5a1810');
+    sky.addColorStop(0.7, '#a02810');
+    sky.addColorStop(1, '#3a0a05');
+    ctx.fillStyle = sky;
+    ctx.fillRect(0, 0, W, H);
+
+    // 🌫️ 遠方煙
+    for (const s of this.smokeParticles) {
+      const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, s.size);
+      g.addColorStop(0, `rgba(60,30,20,${s.alpha})`);
+      g.addColorStop(1, 'rgba(60,30,20,0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(s.x-s.size, s.y-s.size, s.size*2, s.size*2);
+    }
+
+    // 🌋 遠山剪影
+    ctx.fillStyle = '#2a0a05';
+    ctx.beginPath();
+    ctx.moveTo(0, H*0.55);
+    ctx.lineTo(W*0.15, H*0.4);
+    ctx.lineTo(W*0.3, H*0.5);
+    ctx.lineTo(W*0.5, H*0.35);
+    ctx.lineTo(W*0.7, H*0.45);
+    ctx.lineTo(W*0.85, H*0.38);
+    ctx.lineTo(W, H*0.5);
+    ctx.lineTo(W, H*0.7); ctx.lineTo(0, H*0.7);
+    ctx.closePath();
+    ctx.fill();
+
+    // 🪨 地面（左側）
+    const groundLeft = ctx.createLinearGradient(0, this.groundY, 0, H);
+    groundLeft.addColorStop(0, '#5a2a18');
+    groundLeft.addColorStop(1, '#2a0a05');
+    ctx.fillStyle = groundLeft;
+    ctx.fillRect(0, this.groundY, this.lavaLeft, H - this.groundY);
+    // 地面石頭裝飾
+    ctx.fillStyle = '#3a1810';
+    ctx.fillRect(40, this.groundY+12, 18, 8);
+    ctx.fillRect(120, this.groundY+22, 10, 6);
+    ctx.fillRect(200, this.groundY+15, 14, 7);
+
+    // 🪨 地面（右側）
+    ctx.fillStyle = groundLeft;
+    ctx.fillRect(this.lavaRight, this.groundY, W - this.lavaRight, H - this.groundY);
+    ctx.fillStyle = '#3a1810';
+    ctx.fillRect(this.lavaRight + 30, this.groundY+15, 14, 7);
+    ctx.fillRect(this.lavaRight + 90, this.groundY+25, 18, 6);
+
+    // 目標旗子（右側）
+    const flagX = W - 80;
+    const flagY = this.groundY - 50;
+    ctx.fillStyle = '#3a2010';
+    ctx.fillRect(flagX, flagY, 3, 50);
+    const flagWave = Math.sin(this.time * 3) * 4;
+    ctx.fillStyle = '#ffd700';
+    ctx.beginPath();
+    ctx.moveTo(flagX+3, flagY);
+    ctx.lineTo(flagX+30+flagWave, flagY+8);
+    ctx.lineTo(flagX+3, flagY+18);
+    ctx.closePath();
+    ctx.fill();
+    if (this.cleared) {
+      ctx.fillStyle = `rgba(255,215,0,${0.3+Math.sin(this.time*4)*0.2})`;
+      ctx.beginPath();
+      ctx.arc(flagX+10, flagY+8, 25, 0, Math.PI*2);
+      ctx.fill();
+    }
+
+    // 🌋 岩漿河
+    this.drawLava(ctx);
+
+    // 🐱 虎紋貓
+    if (this.cat) this.cat.draw(ctx);
+
+    // ✈️ 飛濺火星（前景）
+    for (const e of this.emberParticles) {
+      const a = (1 - e.life) * 0.8;
+      ctx.fillStyle = `rgba(255, ${100+e.life*100}, 30, ${a})`;
+      ctx.fillRect(e.x, e.y, e.size, e.size);
+    }
+
+    // 🎉 慶祝粒子
+    for (const p of this.successParticles) {
+      const a = 1 - (p.life / p.maxLife);
+      ctx.fillStyle = p.color;
+      ctx.globalAlpha = a;
+      ctx.fillRect(p.x, p.y, p.size*2, p.size*2);
+    }
+    ctx.globalAlpha = 1;
+
+    // 🛠️ 道具列
+    this.drawItems(ctx);
+
+    // 🏷️ 關卡標題
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(W/2 - 130, 16, 260, 36);
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 18px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText(`🔥 火之大陸 — 第 ${this.levelNum} 關`, W/2, 40);
+    ctx.restore();
+
+    // ⬅️ 返回按鈕
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.beginPath();
+    ctx.arc(this.backBtn.x, this.backBtn.y, this.backBtn.r, 0, Math.PI*2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 22px -apple-system';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('←', this.backBtn.x, this.backBtn.y);
+    ctx.textBaseline = 'alphabetic';
+
+    // 💬 提示文字
+    if (this.feedbackText) {
+      const a = Math.min(1, this.feedbackTimer / 0.4);
+      ctx.save();
+      ctx.globalAlpha = a;
+      ctx.fillStyle = 'rgba(0,0,0,0.7)';
+      const tw = ctx.measureText(this.feedbackText).width;
+      ctx.fillRect(W/2 - 200, 70, 400, 36);
+      ctx.fillStyle = this.feedbackColor;
+      ctx.font = 'bold 16px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center';
+      ctx.fillText(this.feedbackText, W/2, 92);
+      ctx.restore();
+    } else if (!this.cleared && !this.catWalking) {
+      // 開頭提示
+      ctx.save();
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.font = '14px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center';
+      ctx.fillText('🐱 怎麼讓虎紋貓過河？點選下方道具試試看', W/2, 75);
+      ctx.restore();
+    }
+
+    // 💡 家長模式提示卡
+    if (this.showHintCard) this.drawHintCard(ctx);
+    // 🏆 過關卡片
+    if (this.showWinCard) this.drawWinCard(ctx);
+
+    // 進場淡入
+    if (this.enterAlpha > 0) {
+      ctx.fillStyle = `rgba(0,0,0,${this.enterAlpha})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+  }
+
+  drawLava(ctx) {
+    const W = Game.width, H = Game.height;
+    const lx = this.lavaLeft, rx = this.lavaRight;
+    const ly = this.groundY;
+    const lh = H - ly;
+
+    // 木橋燒掉中
+    if (this.lavaState === 'wood-burning') {
+      // 先畫橋（灰燼漸變）
+      const burn = Math.min(this.failTime / 2.0, 1);
+      ctx.fillStyle = '#5d4037';
+      ctx.globalAlpha = 1 - burn;
+      ctx.fillRect(lx-10, ly-12, (rx-lx)+20, 14);
+      ctx.globalAlpha = 1;
+      // 火焰特效
+      for (let i = 0; i < 12; i++) {
+        const fx = lx + (rx-lx) * (i/11);
+        const fh = 30 + Math.sin(this.time*8 + i) * 10;
+        const grad = ctx.createLinearGradient(fx, ly-fh, fx, ly);
+        grad.addColorStop(0, 'rgba(255,235,59,0.8)');
+        grad.addColorStop(0.5, 'rgba(255,87,34,0.7)');
+        grad.addColorStop(1, 'rgba(244,67,54,0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(fx-4, ly-fh-burn*5, 8, fh);
+      }
+    }
+
+    // 岩漿主體
+    let lavaTopColor, lavaMidColor, lavaBotColor;
+    if (this.lavaState === 'cooling' || this.lavaState === 'bridged') {
+      const c = this.lavaCooling;
+      lavaTopColor = `rgba(${Math.floor(255-205*c)}, ${Math.floor(160-150*c)}, ${Math.floor(50+10*c)}, 1)`;
+      lavaMidColor = `rgba(${Math.floor(244-200*c)}, ${Math.floor(67-60*c)}, ${Math.floor(54-40*c)}, 1)`;
+      lavaBotColor = `rgba(${Math.floor(120-100*c)}, ${Math.floor(20-15*c)}, ${Math.floor(15-10*c)}, 1)`;
+    } else {
+      lavaTopColor = '#ffa726'; lavaMidColor = '#f44336'; lavaBotColor = '#7a1410';
+    }
+
+    const grad = ctx.createLinearGradient(0, ly, 0, H);
+    grad.addColorStop(0, lavaTopColor);
+    grad.addColorStop(0.5, lavaMidColor);
+    grad.addColorStop(1, lavaBotColor);
+    ctx.fillStyle = grad;
+
+    // 岩漿表面有起伏
+    ctx.beginPath();
+    ctx.moveTo(lx, ly);
+    const steps = 30;
+    for (let i = 0; i <= steps; i++) {
+      const t = i/steps;
+      const px = lx + (rx-lx) * t;
+      const wave = (this.lavaState === 'bridged') ? 0 : Math.sin(this.time*3 + t*8) * 4 + Math.sin(this.time*5 + t*4) * 2;
+      ctx.lineTo(px, ly + wave);
+    }
+    ctx.lineTo(rx, H); ctx.lineTo(lx, H);
+    ctx.closePath();
+    ctx.fill();
+
+    // 岩漿冒泡
+    if (this.lavaState !== 'bridged') {
+      for (const p of this.lavaParticles) {
+        const px = lx + (rx-lx) * p.x;
+        const py = ly + 5 + Math.sin(this.time*p.speed + p.offset) * 8 + p.y * 30;
+        const a = (this.lavaState === 'cooling') ? Math.max(0, 1 - this.lavaCooling) : 0.8;
+        ctx.fillStyle = `rgba(255, 235, 59, ${a})`;
+        ctx.fillRect(px, py, p.size, p.size);
+      }
+    }
+
+    // 石頭沉沒
+    if (this.lavaState === 'rock-sinking') {
+      const sink = Math.min(this.failTime / 1.5, 1);
+      ctx.fillStyle = '#5a4a40';
+      const rockY = ly + sink * 30;
+      ctx.beginPath();
+      ctx.arc((lx+rx)/2, rockY, 18 - sink*5, 0, Math.PI*2);
+      ctx.fill();
+      // 沉沒水波
+      ctx.strokeStyle = `rgba(255,200,100,${0.6*(1-sink)})`;
+      ctx.lineWidth = 2;
+      for (let i = 0; i < 3; i++) {
+        ctx.beginPath();
+        ctx.arc((lx+rx)/2, ly+2, 15 + i*15 + this.failTime*30, 0, Math.PI*2);
+        ctx.stroke();
+      }
+    }
+
+    // 黑曜石橋
+    if (this.lavaState === 'bridged' || this.lavaState === 'cooling') {
+      const a = this.lavaCooling;
+      ctx.fillStyle = `rgba(40, 20, 50, ${a})`;
+      ctx.fillRect(lx, ly - 4, rx-lx, 12);
+      // 黑曜石高光
+      ctx.fillStyle = `rgba(150, 100, 200, ${a * 0.3})`;
+      ctx.fillRect(lx + 10, ly - 3, (rx-lx) - 20, 2);
+      // 邊緣
+      ctx.fillStyle = `rgba(80, 40, 90, ${a})`;
+      ctx.fillRect(lx, ly - 4, rx-lx, 2);
+      ctx.fillRect(lx, ly + 6, rx-lx, 2);
+    }
+
+    // 岩漿邊緣熱光
+    if (this.lavaState !== 'bridged') {
+      const heatGrad = ctx.createLinearGradient(0, ly-30, 0, ly);
+      heatGrad.addColorStop(0, 'rgba(255,150,50,0)');
+      heatGrad.addColorStop(1, `rgba(255,150,50,${0.3*(1-this.lavaCooling)})`);
+      ctx.fillStyle = heatGrad;
+      ctx.fillRect(lx, ly-30, rx-lx, 30);
+    }
+  }
+
+  drawItems(ctx) {
+    const W = Game.width, H = Game.height;
+    // 背景條
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0, H-110, W, 110);
+    ctx.fillStyle = 'rgba(255,255,255,0.1)';
+    ctx.fillRect(0, H-110, W, 1);
+
+    for (const it of this.items) {
+      const wobble = it.used ? 0 : Math.sin(this.time*2 + it.x*0.01) * 2;
+
+      // 圓底
+      ctx.fillStyle = it.used ? 'rgba(50,50,50,0.4)' : 'rgba(255,255,255,0.15)';
+      ctx.beginPath();
+      ctx.arc(it.x, it.y + wobble, it.r, 0, Math.PI*2);
+      ctx.fill();
+      ctx.strokeStyle = it.used ? 'rgba(100,100,100,0.3)' : 'rgba(255,215,0,0.5)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // 圖示
+      ctx.font = '36px -apple-system';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.globalAlpha = it.used ? 0.3 : 1;
+      ctx.fillText(it.icon, it.x, it.y + wobble);
+      ctx.globalAlpha = 1;
+      ctx.textBaseline = 'alphabetic';
+
+      // 名字
+      ctx.fillStyle = it.used ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.85)';
+      ctx.font = '12px -apple-system, "PingFang TC"';
+      ctx.fillText(it.name, it.x, it.y + it.r + 16 + wobble);
+    }
+  }
+
+  drawHintCard(ctx) {
+    const W = Game.width, H = Game.height;
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, W, H);
+
+    const cardW = Math.min(420, W - 40);
+    const cardH = 280;
+    const cx = (W-cardW)/2, cy = (H-cardH)/2;
+
+    // 卡片
+    const grad = ctx.createLinearGradient(0, cy, 0, cy+cardH);
+    grad.addColorStop(0, '#1a3a5a');
+    grad.addColorStop(1, '#0a1a3a');
+    ctx.fillStyle = grad;
+    ctx.strokeStyle = '#ffd700';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(cx, cy, cardW, cardH, 20);
+    else ctx.rect(cx, cy, cardW, cardH);
+    ctx.fill(); ctx.stroke();
+
+    // 標題
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 22px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText('💡 你發現了什麼？', W/2, cy + 40);
+
+    // 內容
+    ctx.fillStyle = '#fff';
+    ctx.font = '15px -apple-system, "PingFang TC"';
+    const lines = [
+      '🔥 岩漿是「很燙的石頭」',
+      '💧 水可以讓岩漿冷卻',
+      '🪨 冷卻後變成黑色的「黑曜石」',
+      '',
+      '✨ 真實世界的火山熔岩',
+      '遇到海水也會這樣變成黑曜石！',
+    ];
+    lines.forEach((line, i) => {
+      ctx.fillStyle = i < 3 ? '#fff' : 'rgba(255,255,255,0.7)';
+      ctx.fillText(line, W/2, cy + 80 + i*26);
+    });
+
+    // 下一步按鈕
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 14px -apple-system, "PingFang TC"';
+    ctx.fillText('（點任意處繼續）', W/2, cy + cardH - 25);
+  }
+
+  drawWinCard(ctx) {
+    const W = Game.width, H = Game.height;
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, W, H);
+
+    const cardW = Math.min(360, W - 40);
+    const cardH = 200;
+    const cx = (W-cardW)/2, cy = (H-cardH)/2;
+
+    const grad = ctx.createLinearGradient(0, cy, 0, cy+cardH);
+    grad.addColorStop(0, '#3a1a5a');
+    grad.addColorStop(1, '#1a0a3a');
+    ctx.fillStyle = grad;
+    ctx.strokeStyle = '#ffd700';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(cx, cy, cardW, cardH, 20);
+    else ctx.rect(cx, cy, cardW, cardH);
+    ctx.fill(); ctx.stroke();
+
+    // 慶祝表情
+    const bounce = Math.abs(Math.sin(this.time*4)) * 6;
+    ctx.font = '52px -apple-system';
+    ctx.textAlign = 'center';
+    ctx.fillText('🎉', W/2, cy + 70 - bounce);
+
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 24px -apple-system, "PingFang TC"';
+    ctx.fillText('過關了！', W/2, cy + 110);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.font = '14px -apple-system, "PingFang TC"';
+    ctx.fillText('🌫️ 火之大陸的霧消散了', W/2, cy + 140);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = '12px -apple-system, "PingFang TC"';
+    ctx.fillText('（點任意處回到火之大陸地圖）', W/2, cy + cardH - 20);
+  }
+}
+
+/* ============================================================
+   🗺️ 火之大陸地圖（關卡選擇）
+   ============================================================ */
+class FireMapScene {
+  constructor() {
+    this.name = 'FireMap';
+    this.time = 0;
+    this.lavaParticles = [];
+    this.smokeParticles = [];
+    this.emberParticles = [];
+    this.cat = null;
+    this.enterAlpha = 1;
+    this.enterTween = new Tween(1, 0, 0.6, Easing.easeOutCubic);
+    this.backBtn = { x: 50, y: 30, r: 22 };
+    this.levels = [];   // 關卡按鈕
+  }
+  enter() {
+    this.layout();
+    this.cat = new PixelCat(Game.width * 0.5, Game.height * 0.85);
+    this.cat.scale = 2;
+    for (let i = 0; i < 20; i++) {
+      this.smokeParticles.push({
+        x: Math.random()*Game.width, y: Math.random()*Game.height*0.5,
+        size: 30+Math.random()*40, speed: 10+Math.random()*15,
+        alpha: 0.05+Math.random()*0.08,
+      });
+    }
+    for (let i = 0; i < 30; i++) {
+      this.emberParticles.push({
+        x: Math.random()*Game.width,
+        y: Game.height + Math.random()*100,
+        vy: -30-Math.random()*40,
+        life: Math.random(),
+        size: 1+Math.random()*2,
+      });
+    }
+  }
+  onResize() { this.layout(); }
+  layout() {
+    const W = Game.width, H = Game.height;
+    // 6 個關卡圖示，沿著「冒險路徑」放（之字形上山到火山口）
+    const fireLv = Game.progress.fireLevel || 0;
+    this.levels = [
+      { num: 1, name: '岩漿河',   x: W*0.18, y: H*0.62, cleared: fireLv>=1, unlocked: true,        r: 36 },
+      { num: 2, name: '火焰封印', x: W*0.34, y: H*0.50, cleared: fireLv>=2, unlocked: fireLv>=1,   r: 36 },
+      { num: 3, name: '火炬之路', x: W*0.50, y: H*0.58, cleared: fireLv>=3, unlocked: fireLv>=2,   r: 36 },
+      { num: 4, name: '火龍蛋',   x: W*0.66, y: H*0.46, cleared: fireLv>=4, unlocked: fireLv>=3,   r: 36 },
+      { num: 5, name: '鎖鏈火球', x: W*0.82, y: H*0.55, cleared: fireLv>=5, unlocked: fireLv>=4,   r: 36 },
+      { num: 6, name: '🐲 烈焰魔王', x: W*0.65, y: H*0.30, cleared: fireLv>=6, unlocked: fireLv>=5, r: 44, isBoss: true },
+    ];
+  }
+  onTap(x, y) {
+    // 返回鈕
+    const bx = x - this.backBtn.x, by = y - this.backBtn.y;
+    if (bx*bx + by*by < this.backBtn.r * this.backBtn.r) {
+      Game.changeScene(new WorldMapScene()); return;
+    }
+    for (const lv of this.levels) {
+      if (!lv.unlocked) continue;
+      const dx = x - lv.x, dy = y - lv.y;
+      if (dx*dx + dy*dy < lv.r*lv.r) {
+        if (lv.num === 1) Game.changeScene(new FireLevelScene(1));
+        else if (lv.num === 2) Game.changeScene(new FireLevel2Scene());
+        else if (lv.num === 3) Game.changeScene(new FireLevel3Scene());
+        else if (lv.num === 4) Game.changeScene(new FireLevel4Scene());
+        else if (lv.num === 5) Game.changeScene(new FireLevel5Scene());
+        else if (lv.num === 6) Game.changeScene(new FireBossScene());
+        return;
+      }
+    }
+  }
+  update(dt) {
+    this.time += dt;
+    this.enterAlpha = this.enterTween.update(dt);
+    if (this.cat) this.cat.update(dt);
+    for (const s of this.smokeParticles) {
+      s.x += s.speed * dt;
+      s.y -= s.speed * dt * 0.5;
+      if (s.y < -50 || s.x > Game.width+100) {
+        s.x = -50; s.y = Game.height*0.5 + Math.random()*100;
+      }
+    }
+    for (const e of this.emberParticles) {
+      e.life += dt * 0.5;
+      e.y += e.vy * dt;
+      if (e.life > 1 || e.y < 0) {
+        e.life = 0; e.x = Math.random() * Game.width;
+        e.y = Game.height + 20;
+      }
+    }
+  }
+  draw(ctx) {
+    const W = Game.width, H = Game.height;
+    // 火紅天空
+    const sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, '#1a0a05'); sky.addColorStop(0.4, '#5a1810');
+    sky.addColorStop(0.7, '#a02810'); sky.addColorStop(1, '#3a0a05');
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+
+    // 煙
+    for (const s of this.smokeParticles) {
+      const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, s.size);
+      g.addColorStop(0, `rgba(60,30,20,${s.alpha})`);
+      g.addColorStop(1, 'rgba(60,30,20,0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(s.x-s.size, s.y-s.size, s.size*2, s.size*2);
+    }
+    // 遠山+火山
+    ctx.fillStyle = '#2a0a05';
+    ctx.beginPath();
+    ctx.moveTo(0, H*0.5); ctx.lineTo(W*0.2, H*0.3);
+    ctx.lineTo(W*0.4, H*0.45); ctx.lineTo(W*0.6, H*0.25);
+    ctx.lineTo(W*0.8, H*0.4); ctx.lineTo(W, H*0.35);
+    ctx.lineTo(W, H*0.7); ctx.lineTo(0, H*0.7);
+    ctx.closePath(); ctx.fill();
+    // 火山口（中間那座）
+    ctx.fillStyle = '#ff5722';
+    ctx.beginPath();
+    ctx.ellipse(W*0.6, H*0.255, 12, 4, 0, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#ffeb3b';
+    ctx.beginPath();
+    ctx.ellipse(W*0.6, H*0.252, 6, 2, 0, 0, Math.PI*2); ctx.fill();
+
+    // 地面
+    const gd = ctx.createLinearGradient(0, H*0.7, 0, H);
+    gd.addColorStop(0, '#5a2a18'); gd.addColorStop(1, '#2a0a05');
+    ctx.fillStyle = gd;
+    ctx.fillRect(0, H*0.7, W, H*0.3);
+
+    // 蜿蜒路徑（連接 6 個關卡的虛線）
+    ctx.strokeStyle = 'rgba(255,200,100,0.4)';
+    ctx.lineWidth = 3;
+    ctx.setLineDash([8, 8]);
+    ctx.beginPath();
+    ctx.moveTo(this.cat.x, this.cat.y - 30);
+    for (let i = 0; i < this.levels.length; i++) {
+      const lv = this.levels[i];
+      if (i === 0) {
+        ctx.lineTo(lv.x, lv.y);
+      } else {
+        const prev = this.levels[i-1];
+        const mx = (prev.x + lv.x) / 2;
+        const my = (prev.y + lv.y) / 2 + (i % 2 === 0 ? 30 : -30);
+        ctx.quadraticCurveTo(mx, my, lv.x, lv.y);
+      }
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 關卡圖示
+    for (const lv of this.levels) {
+      const bob = Math.sin(this.time*2 + lv.num) * 4;
+      const cy = lv.y + bob;
+      // 光暈
+      if (lv.unlocked && !lv.cleared) {
+        const glowColor = lv.isBoss ? '155, 81, 255' : '255, 235, 59';
+        ctx.fillStyle = `rgba(${glowColor},${0.25+Math.sin(this.time*3+lv.num)*0.2})`;
+        ctx.beginPath(); ctx.arc(lv.x, cy, lv.r+18, 0, Math.PI*2); ctx.fill();
+      }
+      // 圓底
+      const grad = ctx.createRadialGradient(lv.x, cy, 0, lv.x, cy, lv.r);
+      if (lv.cleared) {
+        grad.addColorStop(0, '#ffd700'); grad.addColorStop(1, '#b8860b');
+      } else if (lv.isBoss && lv.unlocked) {
+        grad.addColorStop(0, '#9b51e0'); grad.addColorStop(1, '#4a148c');
+      } else if (lv.unlocked) {
+        grad.addColorStop(0, '#ff6f43'); grad.addColorStop(1, '#8d2818');
+      } else {
+        grad.addColorStop(0, '#3a2018'); grad.addColorStop(1, '#1a0a05');
+      }
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(lv.x, cy, lv.r, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = lv.cleared ? '#fff8d0'
+        : (lv.isBoss && lv.unlocked) ? '#ce93d8'
+        : (lv.unlocked ? '#ffeb3b' : '#5a3a30');
+      ctx.lineWidth = 3;
+      ctx.stroke();
+
+      // 關卡編號 / 鎖
+      ctx.fillStyle = lv.unlocked ? '#fff' : 'rgba(255,255,255,0.3)';
+      ctx.font = 'bold 28px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(lv.unlocked ? `${lv.num}` : '🔒', lv.x, cy);
+      ctx.textBaseline = 'alphabetic';
+
+      // 關卡名
+      ctx.fillStyle = lv.unlocked ? 'rgba(255,255,255,0.85)' : 'rgba(255,255,255,0.3)';
+      ctx.font = '13px -apple-system, "PingFang TC"';
+      ctx.fillText(lv.name, lv.x, cy + lv.r + 22);
+      // 已過關打勾
+      if (lv.cleared) {
+        ctx.fillStyle = '#4caf50';
+        ctx.beginPath(); ctx.arc(lv.x+lv.r-8, cy-lv.r+8, 11, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 14px -apple-system';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('✓', lv.x+lv.r-8, cy-lv.r+9);
+        ctx.textBaseline = 'alphabetic';
+      }
+    }
+
+    // 虎紋貓
+    if (this.cat) this.cat.draw(ctx);
+
+    // 火星
+    for (const e of this.emberParticles) {
+      const a = (1 - e.life) * 0.8;
+      ctx.fillStyle = `rgba(255, ${100+e.life*100}, 30, ${a})`;
+      ctx.fillRect(e.x, e.y, e.size, e.size);
+    }
+
+    // 標題
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(W/2 - 110, 16, 220, 36);
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 18px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText('🔥 火之大陸 — 選擇關卡', W/2, 40);
+
+    // 進度
+    const fireLv = Game.progress.fireLevel || 0;
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.font = '13px -apple-system, "PingFang TC"';
+    ctx.fillText(`進度：${fireLv} / 6 關`, W/2, 70);
+
+    // 返回鈕
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.beginPath();
+    ctx.arc(this.backBtn.x, this.backBtn.y, this.backBtn.r, 0, Math.PI*2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 22px -apple-system';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('←', this.backBtn.x, this.backBtn.y);
+    ctx.textBaseline = 'alphabetic';
+
+    // 進場淡入
+    if (this.enterAlpha > 0) {
+      ctx.fillStyle = `rgba(0,0,0,${this.enterAlpha})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+  }
+}
+
+/* ============================================================
+   🔥 火之大陸第 2 關：火焰封印門（兩步驟解謎）
+   ============================================================ */
+class FireLevel2Scene {
+  constructor() {
+    this.name = 'Fire L2';
+    this.time = 0;
+    this.cat = null;
+    this.smokeParticles = [];
+    this.emberParticles = [];
+    this.successParticles = [];
+
+    // 兩階段謎題狀態
+    this.puzzleStep = 1;          // 1: 火很強  2: 火變弱  3: 已解開
+    this.fireIntensity = 1.0;     // 1.0 = 滿火力, 0.4 = 變弱, 0 = 熄滅
+    this.intensityTween = null;
+    this.flameFlash = 0;          // 風箱失敗時火焰瞬間放大
+    this.steamAlpha = 0;          // 水蒸發特效
+    this.steamTween = null;
+
+    // 道具：4 個（順序刻意打散，避免直覺按第一個）
+    this.items = [
+      { id: 'rock',  icon: '🪨', name: '石頭',  used: false, x: 0, y: 0 },
+      { id: 'water', icon: '💧', name: '水桶',  used: false, x: 0, y: 0 },
+      { id: 'ice',   icon: '❄️', name: '冰塊',  used: false, x: 0, y: 0 },
+      { id: 'wind',  icon: '🌬️', name: '風箱',  used: false, x: 0, y: 0 },
+    ];
+
+    this.feedbackText = null;
+    this.feedbackTimer = 0;
+    this.feedbackColor = '#fff';
+
+    this.cleared = false;
+    this.catWalking = false;
+    this.catWalkTween = null;
+    this.doorOpening = 0;          // 0~1
+    this.doorTween = null;
+    this.showHintCard = false;
+    this.showWinCard = false;
+
+    this.enterAlpha = 1;
+    this.enterTween = new Tween(1, 0, 0.6, Easing.easeOutCubic);
+
+    this.backBtn = { x: 50, y: 30, r: 22 };
+  }
+
+  enter() {
+    this.layout();
+    this.cat = new PixelCat(this.catStartX, this.groundY);
+    this.cat.scale = 3;
+    for (let i = 0; i < 15; i++) {
+      this.smokeParticles.push({
+        x: Math.random()*Game.width, y: Math.random()*Game.height*0.4,
+        size: 30+Math.random()*40, speed: 10+Math.random()*15,
+        alpha: 0.05+Math.random()*0.08,
+      });
+    }
+    for (let i = 0; i < 25; i++) {
+      this.emberParticles.push({
+        x: Math.random()*Game.width,
+        y: Game.height + Math.random()*100,
+        vy: -30-Math.random()*40,
+        life: Math.random(), size: 1+Math.random()*2,
+      });
+    }
+  }
+
+  layout() {
+    const W = Game.width, H = Game.height;
+    this.groundY = H * 0.7;
+    this.fireX = W * 0.55;
+    this.doorX = W * 0.78;
+    this.catStartX = W * 0.18;
+    this.catTargetX = W * 0.78;
+
+    const itemY = H - 80;
+    const totalW = Math.min(W * 0.75, 480);
+    const startX = (W - totalW) / 2;
+    const step = totalW / 3;
+    this.items.forEach((it, i) => {
+      it.x = startX + i * step;
+      it.y = itemY;
+      it.r = 36;
+    });
+  }
+  onResize() { this.layout(); if (this.cat) { this.cat.x = this.catStartX; this.cat.y = this.groundY; } }
+
+  onTap(x, y) {
+    const bx = x - this.backBtn.x, by = y - this.backBtn.y;
+    if (bx*bx + by*by < this.backBtn.r * this.backBtn.r) {
+      Game.changeScene(new FireMapScene()); return;
+    }
+    if (this.showWinCard) { Game.changeScene(new FireMapScene()); return; }
+    if (this.showHintCard) { this.showHintCard = false; return; }
+    if (this.cleared || this.catWalking) return;
+
+    for (const it of this.items) {
+      if (it.used) continue;
+      const dx = x - it.x, dy = y - it.y;
+      if (dx*dx + dy*dy < it.r*it.r) { this.useItem(it); return; }
+    }
+  }
+
+  useItem(item) {
+    // 步驟 1：火很強
+    if (this.puzzleStep === 1) {
+      if (item.id === 'ice') {
+        // ✅ 正解：火變弱
+        item.used = true;
+        this.showFeedback('❄️ 冰降低了火的溫度，火變弱了！', '#4fc3f7');
+        this.intensityTween = new Tween(1.0, 0.4, 1.0, Easing.easeOutCubic, () => {
+          this.puzzleStep = 2;
+        });
+      }
+      else if (item.id === 'wind') {
+        // ❌ 火被吹得更旺
+        this.showFeedback('💨 風讓火更旺了！火太強，先要降溫～', '#ff7043');
+        this.flameFlash = 1.0;
+      }
+      else if (item.id === 'water') {
+        // ❌ 水蒸發
+        this.showFeedback('💨 水都蒸發了！火太強，水沒辦法滅～', '#ffb74d');
+        this.steamAlpha = 1.0;
+        this.steamTween = new Tween(1.0, 0, 1.5, Easing.easeOutCubic);
+      }
+      else if (item.id === 'rock') {
+        this.showFeedback('🔥 石頭被燒紅了！這個沒用～', '#ff7043');
+      }
+    }
+    // 步驟 2：火變弱了
+    else if (this.puzzleStep === 2) {
+      if (item.id === 'wind') {
+        // ✅ 正解：吹熄
+        item.used = true;
+        this.showFeedback('🌬️ 風吹散了殘火，門打開了！', '#81c784');
+        this.intensityTween = new Tween(0.4, 0, 0.8, Easing.easeOutCubic, () => {
+          this.puzzleStep = 3;
+          // 開門動畫
+          this.doorTween = new Tween(0, 1, 0.8, Easing.easeOutCubic, () => {
+            setTimeout(() => this.startWalk(), 300);
+          });
+        });
+      }
+      else if (item.id === 'ice') {
+        this.showFeedback('❄️ 火已經很弱了，需要不一樣的方法～', '#4fc3f7');
+      }
+      else if (item.id === 'water') {
+        this.showFeedback('💧 火太小，水會變成小水窪～試試別的', '#ffb74d');
+      }
+      else if (item.id === 'rock') {
+        this.showFeedback('🪨 石頭還是沒用啦！', '#ff7043');
+      }
+    }
+  }
+
+  startWalk() {
+    this.catWalking = true;
+    this.cat.setState('walk');
+    this.catWalkTween = new Tween(this.catStartX, this.catTargetX, 2.0, Easing.easeInOutCubic, () => {
+      this.cat.setState('cheer');
+      this.cleared = true;
+      this.catWalking = false;
+      Game.progress.fireLevel = Math.max(Game.progress.fireLevel || 0, 2);
+      Game.progress.fire = (Game.progress.fireLevel >= 2);
+      Game.saveProgress();
+      this.spawnSuccessParticles();
+      setTimeout(() => {
+        if (Game.parentMode) this.showHintCard = true;
+        else this.showWinCard = true;
+      }, 1200);
+    });
+  }
+
+  spawnSuccessParticles() {
+    for (let i = 0; i < 50; i++) {
+      this.successParticles.push({
+        x: this.cat.x, y: this.cat.y - 60,
+        vx: (Math.random()-0.5) * 240,
+        vy: -120 - Math.random()*180,
+        life: 0, maxLife: 1.4 + Math.random()*0.6,
+        color: ['#ffd700', '#ffeb3b', '#ff5252', '#4fc3f7', '#fff', '#81c784'][Math.floor(Math.random()*6)],
+        size: 2 + Math.random()*2,
+      });
+    }
+  }
+
+  showFeedback(text, color) {
+    this.feedbackText = text; this.feedbackColor = color; this.feedbackTimer = 2.5;
+  }
+
+  update(dt) {
+    this.time += dt;
+    this.enterAlpha = this.enterTween.update(dt);
+    if (this.cat) this.cat.update(dt);
+
+    if (this.intensityTween && !this.intensityTween.done) {
+      this.fireIntensity = this.intensityTween.update(dt);
+    }
+    if (this.steamTween && !this.steamTween.done) {
+      this.steamAlpha = this.steamTween.update(dt);
+    }
+    if (this.doorTween && !this.doorTween.done) {
+      this.doorOpening = this.doorTween.update(dt);
+    }
+    // 風箱失敗火焰閃爍衰減
+    if (this.flameFlash > 0) this.flameFlash = Math.max(0, this.flameFlash - dt * 1.2);
+
+    if (this.catWalkTween && !this.catWalkTween.done) {
+      this.cat.x = this.catWalkTween.update(dt);
+    }
+
+    for (const s of this.smokeParticles) {
+      s.x += s.speed * dt; s.y -= s.speed * dt * 0.5;
+      if (s.y < -50 || s.x > Game.width+100) {
+        s.x = -50; s.y = Game.height*0.5 + Math.random()*100;
+      }
+    }
+    for (const e of this.emberParticles) {
+      e.life += dt * 0.5; e.y += e.vy * dt;
+      if (e.life > 1 || e.y < 0) {
+        e.life = 0; e.x = Math.random() * Game.width;
+        e.y = Game.height + 20;
+      }
+    }
+    for (const p of this.successParticles) {
+      p.life += dt; p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vy += 200 * dt;
+    }
+    this.successParticles = this.successParticles.filter(p => p.life < p.maxLife);
+
+    if (this.feedbackTimer > 0) {
+      this.feedbackTimer -= dt;
+      if (this.feedbackTimer <= 0) this.feedbackText = null;
+    }
+  }
+
+  draw(ctx) {
+    const W = Game.width, H = Game.height;
+
+    // 火紅天空
+    const sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, '#0a0a05'); sky.addColorStop(0.4, '#3a1010');
+    sky.addColorStop(0.7, '#7a2010'); sky.addColorStop(1, '#1a0a05');
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+
+    // 煙
+    for (const s of this.smokeParticles) {
+      const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, s.size);
+      g.addColorStop(0, `rgba(40,20,15,${s.alpha})`);
+      g.addColorStop(1, 'rgba(40,20,15,0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(s.x-s.size, s.y-s.size, s.size*2, s.size*2);
+    }
+
+    // 洞穴頂部（弧形剪影）
+    ctx.fillStyle = '#1a0a05';
+    ctx.beginPath();
+    ctx.moveTo(0, 0); ctx.lineTo(W, 0);
+    ctx.lineTo(W, H*0.15);
+    ctx.quadraticCurveTo(W*0.5, H*0.45, 0, H*0.15);
+    ctx.closePath(); ctx.fill();
+    // 洞穴鐘乳石
+    ctx.fillStyle = '#0a0502';
+    for (let i = 0; i < 6; i++) {
+      const sx = W * (0.1 + i * 0.15);
+      const sh = 30 + Math.sin(i*1.7) * 20;
+      ctx.beginPath();
+      ctx.moveTo(sx-8, H*0.18);
+      ctx.lineTo(sx, H*0.18 + sh);
+      ctx.lineTo(sx+8, H*0.18);
+      ctx.closePath(); ctx.fill();
+    }
+
+    // 地面
+    const gd = ctx.createLinearGradient(0, this.groundY, 0, H);
+    gd.addColorStop(0, '#5a2a18'); gd.addColorStop(1, '#2a0a05');
+    ctx.fillStyle = gd;
+    ctx.fillRect(0, this.groundY, W, H - this.groundY);
+    // 石頭裝飾
+    ctx.fillStyle = '#3a1810';
+    ctx.fillRect(40, this.groundY+15, 18, 8);
+    ctx.fillRect(180, this.groundY+22, 12, 6);
+
+    // 🚪 大門
+    this.drawDoor(ctx);
+
+    // 🔥 火焰封印
+    if (this.fireIntensity > 0.01) this.drawFire(ctx);
+
+    // 蒸氣（水失敗）
+    if (this.steamAlpha > 0) {
+      for (let i = 0; i < 8; i++) {
+        const sx = this.fireX + Math.sin(this.time*2+i) * 20;
+        const sy = this.groundY - 30 - i * 15 - this.time * 30 % 100;
+        const sa = this.steamAlpha * (1 - i/8) * 0.6;
+        const grad = ctx.createRadialGradient(sx, sy, 0, sx, sy, 25);
+        grad.addColorStop(0, `rgba(255,255,255,${sa})`);
+        grad.addColorStop(1, 'rgba(255,255,255,0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(sx-25, sy-25, 50, 50);
+      }
+    }
+
+    // 虎紋貓
+    if (this.cat) this.cat.draw(ctx);
+
+    // 火星
+    for (const e of this.emberParticles) {
+      const a = (1 - e.life) * 0.6;
+      ctx.fillStyle = `rgba(255, ${100+e.life*100}, 30, ${a})`;
+      ctx.fillRect(e.x, e.y, e.size, e.size);
+    }
+
+    // 慶祝粒子
+    for (const p of this.successParticles) {
+      const a = 1 - (p.life / p.maxLife);
+      ctx.fillStyle = p.color;
+      ctx.globalAlpha = a;
+      ctx.fillRect(p.x, p.y, p.size*2, p.size*2);
+    }
+    ctx.globalAlpha = 1;
+
+    // 道具列
+    this.drawItems(ctx);
+
+    // 標題
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(W/2 - 130, 16, 260, 36);
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 18px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText(`🔥 火之大陸 — 第 2 關`, W/2, 40);
+
+    // 步驟指示器
+    if (!this.cleared && !this.catWalking) {
+      ctx.fillStyle = 'rgba(0,0,0,0.4)';
+      ctx.fillRect(W/2 - 90, 56, 180, 22);
+      ctx.fillStyle = this.puzzleStep === 1 ? '#ff7043' : '#81c784';
+      ctx.font = 'bold 13px -apple-system, "PingFang TC"';
+      const stepText = this.puzzleStep === 1 ? '步驟 1/2：火太強，先讓火變弱' : '步驟 2/2：火變弱了，把它弄熄';
+      ctx.fillText(stepText, W/2, 71);
+    }
+
+    // 返回鈕
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.beginPath();
+    ctx.arc(this.backBtn.x, this.backBtn.y, this.backBtn.r, 0, Math.PI*2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 22px -apple-system';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('←', this.backBtn.x, this.backBtn.y);
+    ctx.textBaseline = 'alphabetic';
+
+    // 提示文字
+    if (this.feedbackText) {
+      const a = Math.min(1, this.feedbackTimer / 0.4);
+      ctx.save(); ctx.globalAlpha = a;
+      ctx.fillStyle = 'rgba(0,0,0,0.7)';
+      ctx.fillRect(W/2 - 220, 90, 440, 36);
+      ctx.fillStyle = this.feedbackColor;
+      ctx.font = 'bold 15px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center';
+      ctx.fillText(this.feedbackText, W/2, 113);
+      ctx.restore();
+    }
+
+    if (this.showHintCard) this.drawHintCard(ctx);
+    if (this.showWinCard) this.drawWinCard(ctx);
+
+    if (this.enterAlpha > 0) {
+      ctx.fillStyle = `rgba(0,0,0,${this.enterAlpha})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+  }
+
+  drawDoor(ctx) {
+    const W = Game.width;
+    const dx = this.doorX;
+    const dy = this.groundY;
+    const dw = 60, dh = 100;
+
+    // 門框
+    ctx.fillStyle = '#3a2010';
+    ctx.fillRect(dx - dw/2 - 4, dy - dh - 4, dw + 8, dh + 4);
+    // 門
+    if (this.doorOpening < 0.99) {
+      const openOffset = this.doorOpening * dw * 0.4;
+      // 左半門
+      ctx.fillStyle = '#5d4037';
+      ctx.fillRect(dx - dw/2, dy - dh, dw/2 - openOffset, dh);
+      ctx.fillRect(dx + openOffset, dy - dh, dw/2 - openOffset, dh);
+      // 門紋
+      ctx.strokeStyle = '#3a2010';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(dx - dw/2, dy - dh*0.5);
+      ctx.lineTo(dx - openOffset, dy - dh*0.5);
+      ctx.moveTo(dx + openOffset, dy - dh*0.5);
+      ctx.lineTo(dx + dw/2, dy - dh*0.5);
+      ctx.stroke();
+      // 門把
+      ctx.fillStyle = '#ffd700';
+      ctx.beginPath(); ctx.arc(dx - openOffset - 6, dy - dh/2, 3, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(dx + openOffset + 6, dy - dh/2, 3, 0, Math.PI*2); ctx.fill();
+    }
+    // 門內光（開門後才看到）
+    if (this.doorOpening > 0.1) {
+      const innerW = dw * this.doorOpening * 0.8;
+      const grad = ctx.createLinearGradient(dx, dy-dh, dx, dy);
+      grad.addColorStop(0, `rgba(255,235,150,${this.doorOpening * 0.8})`);
+      grad.addColorStop(1, `rgba(255,180,80,${this.doorOpening * 0.6})`);
+      ctx.fillStyle = grad;
+      ctx.fillRect(dx - innerW/2, dy - dh + 5, innerW, dh - 5);
+    }
+  }
+
+  drawFire(ctx) {
+    const fx = this.fireX;
+    const fy = this.groundY;
+    const intensity = Math.min(1, this.fireIntensity + this.flameFlash * 0.6);
+    const flameH = 90 * intensity;
+    const flameW = 50 * Math.max(0.5, intensity);
+
+    // 火焰光暈
+    const glow = ctx.createRadialGradient(fx, fy - flameH*0.3, 0, fx, fy - flameH*0.3, 80 * intensity);
+    glow.addColorStop(0, `rgba(255, 150, 50, ${0.4 * intensity})`);
+    glow.addColorStop(1, 'rgba(255, 150, 50, 0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(fx - 80, fy - flameH - 20, 160, flameH + 40);
+
+    // 火焰本體（多層）
+    const layers = [
+      { color: 'rgba(244, 67, 54, 0.85)', wScale: 1.0, hScale: 1.0 },
+      { color: 'rgba(255, 152, 0, 0.85)', wScale: 0.75, hScale: 0.85 },
+      { color: 'rgba(255, 235, 59, 0.85)', wScale: 0.45, hScale: 0.65 },
+    ];
+    for (const layer of layers) {
+      const fw = flameW * layer.wScale;
+      const fh = flameH * layer.hScale;
+      ctx.fillStyle = layer.color;
+      ctx.beginPath();
+      const points = 12;
+      for (let i = 0; i <= points; i++) {
+        const t = i / points;
+        const ang = Math.PI + Math.PI * t;
+        const wave = Math.sin(this.time * 8 + i * 0.8) * 4 * intensity;
+        const px = fx + Math.cos(ang) * fw + wave;
+        const py = fy + Math.sin(ang) * fh - fh * 0.3 - Math.abs(Math.sin(ang)) * 5;
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.lineTo(fx + fw*0.6, fy);
+      ctx.lineTo(fx - fw*0.6, fy);
+      ctx.closePath(); ctx.fill();
+    }
+    // 封印符號（火上方）
+    if (intensity > 0.3) {
+      ctx.save();
+      ctx.translate(fx, fy - flameH - 10);
+      ctx.rotate(this.time * 0.5);
+      ctx.fillStyle = `rgba(255, 215, 0, ${intensity * 0.7})`;
+      for (let i = 0; i < 6; i++) {
+        ctx.rotate(Math.PI / 3);
+        ctx.fillRect(-2, -15, 4, 10);
+      }
+      ctx.restore();
+    }
+  }
+
+  drawItems(ctx) {
+    const W = Game.width, H = Game.height;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0, H-110, W, 110);
+    ctx.fillStyle = 'rgba(255,255,255,0.1)';
+    ctx.fillRect(0, H-110, W, 1);
+
+    for (const it of this.items) {
+      const wobble = it.used ? 0 : Math.sin(this.time*2 + it.x*0.01) * 2;
+      ctx.fillStyle = it.used ? 'rgba(50,50,50,0.4)' : 'rgba(255,255,255,0.15)';
+      ctx.beginPath();
+      ctx.arc(it.x, it.y + wobble, it.r, 0, Math.PI*2);
+      ctx.fill();
+      ctx.strokeStyle = it.used ? 'rgba(100,100,100,0.3)' : 'rgba(255,215,0,0.5)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.font = '32px -apple-system';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.globalAlpha = it.used ? 0.3 : 1;
+      ctx.fillText(it.icon, it.x, it.y + wobble);
+      ctx.globalAlpha = 1;
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = it.used ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.85)';
+      ctx.font = '12px -apple-system, "PingFang TC"';
+      ctx.fillText(it.name, it.x, it.y + it.r + 16 + wobble);
+    }
+  }
+
+  drawHintCard(ctx) {
+    const W = Game.width, H = Game.height;
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, W, H);
+    const cardW = Math.min(440, W - 40);
+    const cardH = 320;
+    const cx = (W-cardW)/2, cy = (H-cardH)/2;
+    const grad = ctx.createLinearGradient(0, cy, 0, cy+cardH);
+    grad.addColorStop(0, '#1a3a5a'); grad.addColorStop(1, '#0a1a3a');
+    ctx.fillStyle = grad;
+    ctx.strokeStyle = '#ffd700';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(cx, cy, cardW, cardH, 20);
+    else ctx.rect(cx, cy, cardW, cardH);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 22px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText('💡 火為什麼會熄滅？', W/2, cy + 40);
+    ctx.fillStyle = '#fff';
+    ctx.font = '15px -apple-system, "PingFang TC"';
+    const lines = [
+      '火要燒起來需要 3 樣東西：',
+      '🔥 可燃物（樹枝、紙）',
+      '💨 氧氣（風裡的氣體）',
+      '🌡️ 高溫',
+      '',
+      '只要拿掉一樣，火就會熄滅！',
+      '',
+      '❄️ 冰塊 → 拿走「高溫」',
+      '🌬️ 風箱 → 吹散讓火接觸不到「氧氣」',
+      '',
+      '✨ 這就是消防員的滅火原理 🚒',
+    ];
+    lines.forEach((line, i) => {
+      ctx.fillStyle = (i === 0 || i === 5 || i === 10) ? '#ffd700' : '#fff';
+      ctx.fillText(line, W/2, cy + 75 + i*20);
+    });
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = '12px -apple-system, "PingFang TC"';
+    ctx.fillText('（點任意處繼續）', W/2, cy + cardH - 20);
+  }
+
+  drawWinCard(ctx) {
+    const W = Game.width, H = Game.height;
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, W, H);
+    const cardW = Math.min(360, W - 40);
+    const cardH = 220;
+    const cx = (W-cardW)/2, cy = (H-cardH)/2;
+    const grad = ctx.createLinearGradient(0, cy, 0, cy+cardH);
+    grad.addColorStop(0, '#3a1a5a'); grad.addColorStop(1, '#1a0a3a');
+    ctx.fillStyle = grad;
+    ctx.strokeStyle = '#ffd700';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(cx, cy, cardW, cardH, 20);
+    else ctx.rect(cx, cy, cardW, cardH);
+    ctx.fill(); ctx.stroke();
+    const bounce = Math.abs(Math.sin(this.time*4)) * 6;
+    ctx.font = '52px -apple-system';
+    ctx.textAlign = 'center';
+    ctx.fillText('🎊', W/2, cy + 70 - bounce);
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 24px -apple-system, "PingFang TC"';
+    ctx.fillText('解開封印！', W/2, cy + 110);
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.font = '14px -apple-system, "PingFang TC"';
+    ctx.fillText('🚪 大門打開了！', W/2, cy + 140);
+    ctx.fillText('💪 兩步驟解謎難不倒你', W/2, cy + 162);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = '12px -apple-system, "PingFang TC"';
+    ctx.fillText('（點任意處回到火之大陸地圖）', W/2, cy + cardH - 20);
+  }
+}
+
+/* ============================================================
+   🔥 通用工具：火之大陸關卡共用基底（簡化版）
+   ============================================================ */
+class FireLevelBase {
+  constructor(levelNum) {
+    this.name = `Fire L${levelNum}`;
+    this.levelNum = levelNum;
+    this.continent = 'fire';      // ← 子類別 super 後可改成 water/forest/ice
+    this.mapSceneClass = null;    // ← 子類別可指定回去哪個地圖
+    this.time = 0;
+    this.cat = null;
+    this.smokeParticles = [];
+    this.emberParticles = [];
+    this.successParticles = [];
+    this.cleared = false;
+    this.catWalking = false;
+    this.catWalkTween = null;
+    this.feedbackText = null;
+    this.feedbackTimer = 0;
+    this.feedbackColor = '#fff';
+    this.showHintCard = false;
+    this.showWinCard = false;
+    this.enterAlpha = 1;
+    this.enterTween = new Tween(1, 0, 0.6, Easing.easeOutCubic);
+    this.backBtn = { x: 50, y: 30, r: 22 };
+  }
+  enter() {
+    this.layout();
+    this.cat = new PixelCat(this.catStartX, this.groundY);
+    this.cat.scale = 3;
+    for (let i = 0; i < 15; i++) {
+      this.smokeParticles.push({
+        x: Math.random()*Game.width, y: Math.random()*Game.height*0.4,
+        size: 30+Math.random()*40, speed: 10+Math.random()*15,
+        alpha: 0.05+Math.random()*0.08,
+      });
+    }
+    for (let i = 0; i < 25; i++) {
+      this.emberParticles.push({
+        x: Math.random()*Game.width, y: Game.height + Math.random()*100,
+        vy: -30-Math.random()*40, life: Math.random(), size: 1+Math.random()*2,
+      });
+    }
+    if (this.onEnter) this.onEnter();
+  }
+  baseLayout() {
+    const W = Game.width, H = Game.height;
+    this.groundY = H * 0.7;
+    this.catStartX = W * 0.18;
+    this.catTargetX = W * 0.82;
+  }
+  showFeedback(text, color) {
+    this.feedbackText = text; this.feedbackColor = color || '#fff'; this.feedbackTimer = 2.5;
+  }
+  startWalk(targetX, onArrive) {
+    this.catWalking = true;
+    this.cat.setState('walk');
+    this.catWalkTween = new Tween(this.catStartX, targetX || this.catTargetX, 2.0, Easing.easeInOutCubic, () => {
+      this.cat.setState('cheer');
+      this.cleared = true;
+      this.catWalking = false;
+      Game.progress[this.continent + 'Level'] = Math.max(Game.progress[this.continent + 'Level'] || 0, this.levelNum);
+      Game.progress[this.continent] = (Game.progress[this.continent + 'Level'] >= 6);
+      Game.saveProgress();
+      this.spawnSuccessParticles();
+      if (onArrive) onArrive();
+      setTimeout(() => {
+        if (Game.parentMode) this.showHintCard = true;
+        else this.showWinCard = true;
+      }, 1200);
+    });
+  }
+  spawnSuccessParticles() {
+    for (let i = 0; i < 50; i++) {
+      this.successParticles.push({
+        x: this.cat.x, y: this.cat.y - 60,
+        vx: (Math.random()-0.5) * 240,
+        vy: -120 - Math.random()*180,
+        life: 0, maxLife: 1.4 + Math.random()*0.6,
+        color: ['#ffd700','#ffeb3b','#ff5252','#4fc3f7','#fff','#81c784'][Math.floor(Math.random()*6)],
+        size: 2 + Math.random()*2,
+      });
+    }
+  }
+  baseUpdate(dt) {
+    this.time += dt;
+    this.enterAlpha = this.enterTween.update(dt);
+    if (this.cat) this.cat.update(dt);
+    if (this.catWalkTween && !this.catWalkTween.done) this.cat.x = this.catWalkTween.update(dt);
+    for (const s of this.smokeParticles) {
+      s.x += s.speed * dt; s.y -= s.speed * dt * 0.5;
+      if (s.y < -50 || s.x > Game.width+100) { s.x = -50; s.y = Game.height*0.5 + Math.random()*100; }
+    }
+    for (const e of this.emberParticles) {
+      e.life += dt * 0.5; e.y += e.vy * dt;
+      if (e.life > 1 || e.y < 0) { e.life = 0; e.x = Math.random() * Game.width; e.y = Game.height + 20; }
+    }
+    for (const p of this.successParticles) {
+      p.life += dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 200 * dt;
+    }
+    this.successParticles = this.successParticles.filter(p => p.life < p.maxLife);
+    if (this.feedbackTimer > 0) {
+      this.feedbackTimer -= dt;
+      if (this.feedbackTimer <= 0) this.feedbackText = null;
+    }
+  }
+  drawBackground(ctx) {
+    const W = Game.width, H = Game.height;
+    const sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, '#1a0a05'); sky.addColorStop(0.4, '#5a1810');
+    sky.addColorStop(0.7, '#a02810'); sky.addColorStop(1, '#3a0a05');
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+    for (const s of this.smokeParticles) {
+      const g = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, s.size);
+      g.addColorStop(0, `rgba(60,30,20,${s.alpha})`); g.addColorStop(1, 'rgba(60,30,20,0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(s.x-s.size, s.y-s.size, s.size*2, s.size*2);
+    }
+    // 遠山
+    ctx.fillStyle = '#2a0a05';
+    ctx.beginPath();
+    ctx.moveTo(0, H*0.55); ctx.lineTo(W*0.15, H*0.4); ctx.lineTo(W*0.3, H*0.5);
+    ctx.lineTo(W*0.5, H*0.35); ctx.lineTo(W*0.7, H*0.45);
+    ctx.lineTo(W*0.85, H*0.38); ctx.lineTo(W, H*0.5);
+    ctx.lineTo(W, H*0.7); ctx.lineTo(0, H*0.7);
+    ctx.closePath(); ctx.fill();
+    // 地面
+    const gd = ctx.createLinearGradient(0, this.groundY, 0, H);
+    gd.addColorStop(0, '#5a2a18'); gd.addColorStop(1, '#2a0a05');
+    ctx.fillStyle = gd;
+    ctx.fillRect(0, this.groundY, W, H - this.groundY);
+  }
+  drawForeground(ctx) {
+    const W = Game.width, H = Game.height;
+    // 火星
+    for (const e of this.emberParticles) {
+      const a = (1 - e.life) * 0.6;
+      ctx.fillStyle = `rgba(255, ${100+e.life*100}, 30, ${a})`;
+      ctx.fillRect(e.x, e.y, e.size, e.size);
+    }
+    // 慶祝粒子
+    for (const p of this.successParticles) {
+      const a = 1 - (p.life / p.maxLife);
+      ctx.fillStyle = p.color; ctx.globalAlpha = a;
+      ctx.fillRect(p.x, p.y, p.size*2, p.size*2);
+    }
+    ctx.globalAlpha = 1;
+  }
+  drawHeader(ctx, title, hint) {
+    const W = Game.width;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(W/2 - 130, 16, 260, 36);
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 18px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText(title, W/2, 40);
+    if (hint && !this.cleared && !this.catWalking) {
+      ctx.fillStyle = 'rgba(0,0,0,0.4)';
+      ctx.fillRect(W/2 - 180, 56, 360, 22);
+      ctx.fillStyle = '#ffe082';
+      ctx.font = 'bold 13px -apple-system, "PingFang TC"';
+      ctx.fillText(hint, W/2, 71);
+    }
+  }
+  drawBackBtn(ctx) {
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.beginPath(); ctx.arc(this.backBtn.x, this.backBtn.y, this.backBtn.r, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 22px -apple-system';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('←', this.backBtn.x, this.backBtn.y);
+    ctx.textBaseline = 'alphabetic';
+  }
+  drawFeedback(ctx) {
+    if (!this.feedbackText) return;
+    const W = Game.width;
+    const a = Math.min(1, this.feedbackTimer / 0.4);
+    ctx.save(); ctx.globalAlpha = a;
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(W/2 - 220, 90, 440, 36);
+    ctx.fillStyle = this.feedbackColor;
+    ctx.font = 'bold 15px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText(this.feedbackText, W/2, 113);
+    ctx.restore();
+  }
+  drawWinCard(ctx, msg) {
+    const W = Game.width, H = Game.height;
+    ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 0, W, H);
+    const cardW = Math.min(360, W - 40), cardH = 220;
+    const cx = (W-cardW)/2, cy = (H-cardH)/2;
+    const grad = ctx.createLinearGradient(0, cy, 0, cy+cardH);
+    grad.addColorStop(0, '#3a1a5a'); grad.addColorStop(1, '#1a0a3a');
+    ctx.fillStyle = grad;
+    ctx.strokeStyle = '#ffd700'; ctx.lineWidth = 3;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(cx, cy, cardW, cardH, 20);
+    else ctx.rect(cx, cy, cardW, cardH);
+    ctx.fill(); ctx.stroke();
+    const bounce = Math.abs(Math.sin(this.time*4)) * 6;
+    ctx.font = '52px -apple-system'; ctx.textAlign = 'center';
+    ctx.fillText('🎉', W/2, cy + 70 - bounce);
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 24px -apple-system, "PingFang TC"';
+    ctx.fillText(msg || '過關了！', W/2, cy + 110);
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.font = '14px -apple-system, "PingFang TC"';
+    ctx.fillText(`第 ${this.levelNum} 關完成 ✨`, W/2, cy + 140);
+    // 大顆按鈕（更明顯）
+    const btnW = 180, btnH = 38;
+    const btnX = (W - btnW) / 2, btnY = cy + cardH - 56;
+    const pulseAlpha = 0.7 + Math.sin(this.time*3)*0.3;
+    ctx.fillStyle = `rgba(255, 215, 0, ${pulseAlpha})`;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(btnX, btnY, btnW, btnH, 19);
+    else ctx.rect(btnX, btnY, btnW, btnH);
+    ctx.fill();
+    ctx.fillStyle = '#1a0a3a';
+    ctx.font = 'bold 14px -apple-system, "PingFang TC"';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('👆 點任意處回地圖', W/2, btnY + btnH/2);
+    ctx.textBaseline = 'alphabetic';
+  }
+  drawHintCard(ctx, title, lines) {
+    const W = Game.width, H = Game.height;
+    ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 0, W, H);
+    const cardW = Math.min(440, W - 40);
+    const cardH = 90 + lines.length * 22;
+    const cx = (W-cardW)/2, cy = (H-cardH)/2;
+    const grad = ctx.createLinearGradient(0, cy, 0, cy+cardH);
+    grad.addColorStop(0, '#1a3a5a'); grad.addColorStop(1, '#0a1a3a');
+    ctx.fillStyle = grad;
+    ctx.strokeStyle = '#ffd700'; ctx.lineWidth = 3;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(cx, cy, cardW, cardH, 20);
+    else ctx.rect(cx, cy, cardW, cardH);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 22px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText(title, W/2, cy + 40);
+    ctx.font = '15px -apple-system, "PingFang TC"';
+    lines.forEach((line, i) => {
+      ctx.fillStyle = line.startsWith('✨') || line.startsWith('💡') ? '#ffd700' : '#fff';
+      ctx.fillText(line, W/2, cy + 75 + i*22);
+    });
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = '12px -apple-system, "PingFang TC"';
+    ctx.fillText('（點任意處繼續）', W/2, cy + cardH - 20);
+  }
+  drawEnterFade(ctx) {
+    if (this.enterAlpha > 0) {
+      ctx.fillStyle = `rgba(0,0,0,${this.enterAlpha})`;
+      ctx.fillRect(0, 0, Game.width, Game.height);
+    }
+  }
+  baseTap(x, y) {
+    const dx = x - this.backBtn.x, dy = y - this.backBtn.y;
+    const MapClass = this.mapSceneClass || FireMapScene;
+    if (dx*dx + dy*dy < this.backBtn.r * this.backBtn.r) {
+      Game.changeScene(new MapClass()); return 'back';
+    }
+    if (this.showWinCard) { Game.changeScene(new MapClass()); return 'back'; }
+    if (this.showHintCard) { this.showHintCard = false; return 'closeHint'; }
+    if (this.cleared || this.catWalking) return 'busy';
+    return null;
+  }
+}
+
+/* ============================================================
+   🔥 第 3 關：火炬之路（規律辨識 — 按指定順序點亮 3 個火炬）
+   ============================================================ */
+class FireLevel3Scene extends FireLevelBase {
+  constructor() {
+    super(3);
+    // 3 個火炬，玩家要按「中、左、右」順序點亮
+    this.torches = [];
+    this.correctOrder = [1, 0, 2]; // 中→左→右
+    this.currentStep = 0;
+    this.showHint = true;
+  }
+  onEnter() {
+    const W = Game.width;
+    const positions = [W*0.32, W*0.5, W*0.68];
+    this.torches = positions.map((px, i) => ({
+      x: px, y: this.groundY, lit: false, litTime: 0, idx: i,
+      flicker: Math.random() * Math.PI * 2,
+    }));
+  }
+  layout() { this.baseLayout(); if (this.torches) {
+    const W = Game.width;
+    const positions = [W*0.32, W*0.5, W*0.68];
+    this.torches.forEach((t, i) => { t.x = positions[i]; t.y = this.groundY; });
+  }}
+  onResize() { this.layout(); if (this.cat) { this.cat.x = this.catStartX; this.cat.y = this.groundY; } }
+  onTap(x, y) {
+    if (this.baseTap(x, y) !== null) return;
+    for (const t of this.torches) {
+      if (t.lit) continue;
+      const dx = x - t.x, dy = y - (t.y - 50);
+      if (dx*dx + dy*dy < 50*50) {
+        const expectedIdx = this.correctOrder[this.currentStep];
+        if (t.idx === expectedIdx) {
+          t.lit = true; t.litTime = this.time;
+          this.currentStep++;
+          this.showFeedback(`✨ 點對了！(${this.currentStep}/3)`, '#81c784');
+          if (this.currentStep >= 3) {
+            setTimeout(() => this.startWalk(), 800);
+          }
+        } else {
+          // 答錯：所有火炬熄滅，重來
+          this.showFeedback('❌ 順序錯了！全部熄滅，再從頭來', '#ff7043');
+          for (const tt of this.torches) tt.lit = false;
+          this.currentStep = 0;
+        }
+        return;
+      }
+    }
+  }
+  update(dt) { this.baseUpdate(dt); }
+  draw(ctx) {
+    const W = Game.width, H = Game.height;
+    this.drawBackground(ctx);
+
+    // 規律提示牆（左上方告示牌 — 用圖示讓孩子自己推理）
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(W/2 - 150, H*0.20, 300, 90);
+    ctx.strokeStyle = '#ffd700'; ctx.lineWidth = 2;
+    ctx.strokeRect(W/2 - 150, H*0.20, 300, 90);
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 14px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText('🪧 古老石碑', W/2, H*0.20 + 22);
+    // 三個圈圈代表火炬位置，亮的是 idx 1（中）、0（左）、2（右）
+    // 但用「順序符號 1️⃣ 2️⃣ 3️⃣」放在火炬位置上面讓孩子推理
+    ctx.fillStyle = '#fff';
+    ctx.font = '13px -apple-system, "PingFang TC"';
+    ctx.fillText('找出正確的點亮順序', W/2, H*0.20 + 42);
+    // 三個位置示意（左 中 右）
+    const cx = W/2;
+    const cy = H*0.20 + 70;
+    const positions = [-50, 0, 50];
+    const orderSymbols = ['②', '①', '③']; // 左=2, 中=1, 右=3
+    for (let i = 0; i < 3; i++) {
+      // 圓圈
+      ctx.fillStyle = '#3a2010';
+      ctx.beginPath(); ctx.arc(cx + positions[i], cy, 13, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = '#ffd700'; ctx.lineWidth = 1.5;
+      ctx.stroke();
+      // 順序數字
+      ctx.fillStyle = '#ffd700';
+      ctx.font = 'bold 16px -apple-system, "PingFang TC"';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(orderSymbols[i], cx + positions[i], cy);
+      ctx.textBaseline = 'alphabetic';
+    }
+
+    // 火炬
+    for (let i = 0; i < this.torches.length; i++) {
+      const t = this.torches[i];
+      // 桿
+      ctx.fillStyle = '#5d4037';
+      ctx.fillRect(t.x - 4, t.y - 60, 8, 60);
+      // 火盆
+      ctx.fillStyle = '#3a2010';
+      ctx.beginPath();
+      ctx.ellipse(t.x, t.y - 55, 14, 6, 0, 0, Math.PI*2); ctx.fill();
+      // 火焰（如果點亮）
+      if (t.lit) {
+        const intensity = Math.min(1, (this.time - t.litTime) * 3);
+        const flameH = 50 * intensity;
+        for (let k = 0; k < 3; k++) {
+          const layerColors = ['rgba(244,67,54,0.85)', 'rgba(255,152,0,0.85)', 'rgba(255,235,59,0.85)'];
+          const wScale = [1.0, 0.7, 0.4][k];
+          const hScale = [1.0, 0.85, 0.65][k];
+          ctx.fillStyle = layerColors[k];
+          ctx.beginPath();
+          const fw = 14 * wScale, fh = flameH * hScale;
+          ctx.moveTo(t.x - fw, t.y - 55);
+          for (let p = 0; p <= 8; p++) {
+            const px = t.x - fw + (fw*2) * (p/8);
+            const py = t.y - 55 - fh * Math.sin(Math.PI * p/8) + Math.sin(this.time*8 + p + i) * 2;
+            ctx.lineTo(px, py);
+          }
+          ctx.lineTo(t.x + fw, t.y - 55);
+          ctx.closePath(); ctx.fill();
+        }
+        // 光暈
+        const glow = ctx.createRadialGradient(t.x, t.y - 70, 0, t.x, t.y - 70, 60);
+        glow.addColorStop(0, 'rgba(255,200,80,0.4)'); glow.addColorStop(1, 'rgba(255,200,80,0)');
+        ctx.fillStyle = glow;
+        ctx.fillRect(t.x - 60, t.y - 130, 120, 120);
+      } else {
+        // 未點亮：顯示淡淡微光（不指示順序，讓玩家自己思考）
+        ctx.fillStyle = `rgba(255, 200, 80, 0.15)`;
+        ctx.beginPath(); ctx.arc(t.x, t.y - 55, 18, 0, Math.PI*2); ctx.fill();
+      }
+      // 編號
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.font = 'bold 12px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center';
+      ctx.fillText(['左','中','右'][i], t.x, t.y + 18);
+    }
+
+    if (this.cat) this.cat.draw(ctx);
+    this.drawForeground(ctx);
+    this.drawHeader(ctx, '🔥 火之大陸 — 第 3 關 火炬之路', `按順序點亮火炬！(${this.currentStep}/3)`);
+    this.drawBackBtn(ctx);
+    this.drawFeedback(ctx);
+
+    if (this.showHintCard) {
+      this.drawHintCard(ctx, '💡 規律與順序', [
+        '世界上很多事情都有「順序」：',
+        '🚪 先開門才能走出去',
+        '🍳 先打蛋才能煎蛋',
+        '👕 先穿內衣才穿外衣',
+        '',
+        '✨ 學會看「規律」找順序',
+        '是很重要的邏輯思考能力！',
+      ]);
+    }
+    if (this.showWinCard) this.drawWinCard(ctx);
+    this.drawEnterFade(ctx);
+  }
+}
+
+/* ============================================================
+   🔥 第 4 關：火龍蛋（條件平衡 — 加溫剛剛好才孵化）
+   ============================================================ */
+class FireLevel4Scene extends FireLevelBase {
+  constructor() {
+    super(4);
+    this.eggHeat = 30;             // 溫度 0~100
+    this.targetMin = 50;
+    this.targetMax = 70;
+    this.heating = false;
+    this.cooling = false;
+    this.hatched = false;
+    this.babyDragon = null;        // 出生的小火龍位置
+    this.crackLevel = 0;           // 蛋的裂痕程度
+    this.wrongTimer = 0;           // 過熱/過冷警示
+  }
+  layout() {
+    this.baseLayout();
+    const W = Game.width;
+    this.eggX = W * 0.5;
+    this.eggY = this.groundY - 30;
+  }
+  onResize() { this.layout(); if (this.cat) { this.cat.x = this.catStartX; this.cat.y = this.groundY; } }
+  onTap(x, y) {
+    if (this.baseTap(x, y) !== null) return;
+    if (this.hatched) return;
+    const W = Game.width, H = Game.height;
+    // 兩個按鈕
+    const btnY = H - 80;
+    const btnHeat = { x: W*0.35, y: btnY, r: 42 };
+    const btnCool = { x: W*0.65, y: btnY, r: 42 };
+    const dh = x - btnHeat.x, dh2 = y - btnHeat.y;
+    const dc = x - btnCool.x, dc2 = y - btnCool.y;
+    if (dh*dh + dh2*dh2 < btnHeat.r*btnHeat.r) { this.heating = true; this.cooling = false; }
+    else if (dc*dc + dc2*dc2 < btnCool.r*btnCool.r) { this.cooling = true; this.heating = false; }
+    else { this.heating = false; this.cooling = false; }
+  }
+  update(dt) {
+    this.baseUpdate(dt);
+    // 小龍時間要持續累加（即使已孵化）
+    if (this.babyDragon) this.babyDragon.time += dt;
+    if (this.hatched) return;
+    if (this.heating) this.eggHeat = Math.min(100, this.eggHeat + 25 * dt);
+    else if (this.cooling) this.eggHeat = Math.max(0, this.eggHeat - 25 * dt);
+    else this.eggHeat += (40 - this.eggHeat) * dt * 0.3; // 自然趨近 40
+
+    // 在目標區停留 → 累積裂痕
+    if (this.eggHeat >= this.targetMin && this.eggHeat <= this.targetMax) {
+      this.crackLevel += dt * 30;
+      this.wrongTimer = 0;
+      if (this.crackLevel >= 100 && !this.hatched) {
+        this.hatched = true;
+        this.babyDragon = { x: this.eggX, y: this.eggY, time: 0 };
+        this.showFeedback('🐉 火龍蛋孵化了！', '#ffd700');
+        setTimeout(() => this.startWalk(), 1800);
+      }
+    } else {
+      // 偏離目標太久警示
+      this.wrongTimer += dt;
+      this.crackLevel = Math.max(0, this.crackLevel - dt * 15);
+      if (this.eggHeat > 90 && this.wrongTimer > 0.4) {
+        this.wrongTimer = 0;
+        this.showFeedback('🥵 太燙了！蛋會被燒焦', '#ff5252');
+      } else if (this.eggHeat < 20 && this.wrongTimer > 0.4) {
+        this.wrongTimer = 0;
+        this.showFeedback('🥶 太冷了！蛋孵不出來', '#4fc3f7');
+      }
+    }
+  }
+  draw(ctx) {
+    const W = Game.width, H = Game.height;
+    this.drawBackground(ctx);
+
+    // 蛋的台座
+    ctx.fillStyle = '#3a2010';
+    ctx.beginPath();
+    ctx.ellipse(this.eggX, this.eggY + 25, 50, 8, 0, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#5d4037';
+    ctx.fillRect(this.eggX - 35, this.eggY + 18, 70, 14);
+
+    // 蛋
+    if (!this.hatched) {
+      const wobble = Math.sin(this.time*8) * (this.crackLevel/100) * 2;
+      // 蛋身（紅色花紋）
+      const eggGrad = ctx.createRadialGradient(this.eggX-8, this.eggY-15, 0, this.eggX, this.eggY, 35);
+      eggGrad.addColorStop(0, '#ffcdd2'); eggGrad.addColorStop(1, '#c62828');
+      ctx.fillStyle = eggGrad;
+      ctx.beginPath();
+      ctx.ellipse(this.eggX + wobble, this.eggY, 28, 36, 0, 0, Math.PI*2);
+      ctx.fill();
+      // 紅色花紋
+      ctx.fillStyle = '#7f0000';
+      ctx.beginPath(); ctx.ellipse(this.eggX-10+wobble, this.eggY-5, 4, 7, 0.3, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(this.eggX+8+wobble, this.eggY+8, 5, 8, -0.3, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(this.eggX-3+wobble, this.eggY+15, 3, 5, 0, 0, Math.PI*2); ctx.fill();
+      // 裂痕
+      if (this.crackLevel > 30) {
+        ctx.strokeStyle = '#3a0a05'; ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(this.eggX-8+wobble, this.eggY-20);
+        ctx.lineTo(this.eggX-2+wobble, this.eggY-10);
+        ctx.lineTo(this.eggX+5+wobble, this.eggY);
+        if (this.crackLevel > 60) {
+          ctx.lineTo(this.eggX-3+wobble, this.eggY+12);
+          ctx.lineTo(this.eggX+7+wobble, this.eggY+22);
+        }
+        ctx.stroke();
+      }
+      // 過熱/過冷 視覺回饋
+      if (this.eggHeat > 90) {
+        ctx.fillStyle = `rgba(255,87,34,${0.3+Math.sin(this.time*8)*0.2})`;
+        ctx.beginPath(); ctx.arc(this.eggX, this.eggY, 50, 0, Math.PI*2); ctx.fill();
+      } else if (this.eggHeat < 20) {
+        ctx.fillStyle = `rgba(100,200,255,${0.3+Math.sin(this.time*4)*0.15})`;
+        ctx.beginPath(); ctx.arc(this.eggX, this.eggY, 50, 0, Math.PI*2); ctx.fill();
+      }
+    } else {
+      // 小火龍出生！
+      const t = this.babyDragon.time;
+      const popY = this.eggY - Math.min(t * 30, 30);
+      const scale = Math.min(t * 1.5, 1);
+      ctx.save();
+      ctx.translate(this.babyDragon.x, popY);
+      ctx.scale(scale, scale);
+      // 龍身
+      ctx.fillStyle = '#e53935';
+      ctx.beginPath(); ctx.arc(0, 0, 18, 0, Math.PI*2); ctx.fill();
+      // 翅膀
+      ctx.fillStyle = '#ff7043';
+      ctx.beginPath(); ctx.ellipse(-15, -5, 10, 6, -0.3, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(15, -5, 10, 6, 0.3, 0, Math.PI*2); ctx.fill();
+      // 眼睛
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(-6, -3, 3, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(6, -3, 3, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#000';
+      ctx.beginPath(); ctx.arc(-6, -3, 1.5, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(6, -3, 1.5, 0, Math.PI*2); ctx.fill();
+      // 口
+      ctx.fillStyle = '#7f0000';
+      ctx.beginPath(); ctx.arc(0, 5, 4, 0, Math.PI); ctx.fill();
+      // 角
+      ctx.fillStyle = '#ffd700';
+      ctx.beginPath();
+      ctx.moveTo(-5, -15); ctx.lineTo(-3, -22); ctx.lineTo(-1, -15);
+      ctx.closePath(); ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(5, -15); ctx.lineTo(3, -22); ctx.lineTo(1, -15);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+
+    // 溫度計
+    const tcX = W * 0.85;
+    const tcY = H * 0.5;
+    const tcH = 200;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(tcX - 18, tcY - tcH/2, 36, tcH);
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(tcX - 18, tcY - tcH/2, 36, tcH);
+    // 目標區（綠色）
+    const minY = tcY + tcH/2 - tcH * (this.targetMin/100);
+    const maxY = tcY + tcH/2 - tcH * (this.targetMax/100);
+    ctx.fillStyle = 'rgba(76, 175, 80, 0.4)';
+    ctx.fillRect(tcX - 18, maxY, 36, minY - maxY);
+    // 目前溫度條
+    const heatY = tcY + tcH/2 - tcH * (this.eggHeat/100);
+    let heatColor = '#ffd700';
+    if (this.eggHeat > 90) heatColor = '#ff5252';
+    else if (this.eggHeat < 20) heatColor = '#4fc3f7';
+    else if (this.eggHeat >= this.targetMin && this.eggHeat <= this.targetMax) heatColor = '#4caf50';
+    ctx.fillStyle = heatColor;
+    ctx.fillRect(tcX - 14, heatY, 28, tcY + tcH/2 - heatY);
+    // 標籤
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 11px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText('🔥 熱', tcX, tcY - tcH/2 - 8);
+    ctx.fillText('❄️ 冷', tcX, tcY + tcH/2 + 18);
+    ctx.fillStyle = '#4caf50';
+    ctx.font = 'bold 10px -apple-system';
+    ctx.fillText('剛好', tcX + 28, (minY + maxY)/2 + 4);
+    // 溫度數字
+    ctx.fillStyle = heatColor;
+    ctx.font = 'bold 14px -apple-system';
+    ctx.fillText(`${Math.floor(this.eggHeat)}°`, tcX, heatY - 6);
+
+    // 進度條（孵化）
+    if (!this.hatched && this.crackLevel > 0) {
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.fillRect(W/2 - 80, H*0.22, 160, 14);
+      ctx.fillStyle = '#ffd700';
+      ctx.fillRect(W/2 - 80, H*0.22, 160 * (this.crackLevel/100), 14);
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(W/2 - 80, H*0.22, 160, 14);
+      ctx.fillStyle = '#fff';
+      ctx.font = '11px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center';
+      ctx.fillText('孵化進度', W/2, H*0.22 - 4);
+    }
+
+    if (this.cat) this.cat.draw(ctx);
+    this.drawForeground(ctx);
+
+    // 控制按鈕
+    const btnY = H - 80;
+    [
+      { x: W*0.35, label: '🔥 加熱', color: '#ff5722', active: this.heating },
+      { x: W*0.65, label: '❄️ 降溫', color: '#03a9f4', active: this.cooling },
+    ].forEach(btn => {
+      ctx.fillStyle = btn.active ? btn.color : 'rgba(255,255,255,0.15)';
+      ctx.beginPath(); ctx.arc(btn.x, btnY, 42, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = btn.color; ctx.lineWidth = 3;
+      ctx.stroke();
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 14px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(btn.label, btn.x, btnY);
+      ctx.textBaseline = 'alphabetic';
+    });
+
+    this.drawHeader(ctx, '🔥 火之大陸 — 第 4 關 火龍蛋', '溫度太高會燒焦，太低孵不出來，找剛剛好的點！');
+    this.drawBackBtn(ctx);
+    this.drawFeedback(ctx);
+
+    if (this.showHintCard) {
+      this.drawHintCard(ctx, '💡 過猶不及', [
+        '世界上很多事情都要「剛剛好」：',
+        '🍜 麵不能太硬也不能太爛',
+        '🌱 植物澆水不能太多也不能太少',
+        '😴 睡覺不能太少也不能太多',
+        '',
+        '✨ 找到「剛剛好」的平衡點',
+        '是很重要的判斷力！',
+      ]);
+    }
+    if (this.showWinCard) this.drawWinCard(ctx, '蛋孵化了！');
+    this.drawEnterFade(ctx);
+  }
+}
+
+/* ============================================================
+   🔥 第 5 關：鎖鏈火球（連鎖反應 — 預測哪個火球會引爆全部）
+   ============================================================ */
+class FireLevel5Scene extends FireLevelBase {
+  constructor() {
+    super(5);
+    // 5 個火球。編號刻意打亂，玩家必須看箭頭才能找出正解
+    // 位置 idx: 0  1  2  3  4
+    // 顯示編號:  3  1  4  2  5
+    // 連鎖路徑（label 視角）：3 → 2 → 1 → 5；3 → 4 → 5
+    // 只有點「3」才能炸光全部
+    this.fireballs = [];
+    this.labels = [3, 1, 4, 2, 5];   // idx → 顯示編號
+    this.connections = [
+      [3, 2],   // idx 0 (label 3) → idx 3 (label 2), idx 2 (label 4)
+      [4],      // idx 1 (label 1) → idx 4 (label 5)
+      [4],      // idx 2 (label 4) → idx 4 (label 5)
+      [1],      // idx 3 (label 2) → idx 1 (label 1)
+      [],       // idx 4 (label 5) → 無
+    ];
+    this.exploded = new Set();
+    this.tapped = false;
+  }
+  layout() {
+    this.baseLayout();
+    const W = Game.width, H = Game.height;
+    // 5 個火球，在洞穴頂部
+    const ys = [H*0.32, H*0.42, H*0.30, H*0.45, H*0.34];
+    const xs = [W*0.2, W*0.32, W*0.46, W*0.62, W*0.78];
+    if (this.fireballs.length === 0) {
+      for (let i = 0; i < 5; i++) {
+        this.fireballs.push({ x: xs[i], y: ys[i], idx: i, exploding: false, explodeTime: 0 });
+      }
+    } else {
+      this.fireballs.forEach((f, i) => { f.x = xs[i]; f.y = ys[i]; });
+    }
+  }
+  onResize() { this.layout(); if (this.cat) { this.cat.x = this.catStartX; this.cat.y = this.groundY; } }
+  onTap(x, y) {
+    if (this.baseTap(x, y) !== null) return;
+    if (this.tapped) return;
+    for (const f of this.fireballs) {
+      const dx = x - f.x, dy = y - f.y;
+      if (dx*dx + dy*dy < 32*32) {
+        this.tapped = true;
+        this.triggerChain(f.idx);
+        return;
+      }
+    }
+  }
+  triggerChain(idx) {
+    // 引爆 idx，再連鎖
+    const explode = (i, delay) => {
+      setTimeout(() => {
+        const fb = this.fireballs[i];
+        fb.exploding = true; fb.explodeTime = this.time;
+        this.exploded.add(i);
+        // 連鎖
+        for (const next of this.connections[i]) {
+          if (!this.exploded.has(next)) explode(next, 350);
+        }
+      }, delay);
+    };
+    explode(idx, 0);
+    // 1.5 秒後檢查
+    setTimeout(() => {
+      if (this.exploded.size === 5) {
+        this.showFeedback('🎆 全部炸光！', '#ffd700');
+        setTimeout(() => this.startWalk(), 600);
+      } else {
+        this.showFeedback(`💣 只炸到 ${this.exploded.size} 個！再試試別的順序`, '#ff7043');
+        setTimeout(() => {
+          // 重置
+          this.fireballs.forEach(f => { f.exploding = false; });
+          this.exploded.clear();
+          this.tapped = false;
+        }, 1500);
+      }
+    }, 2500);
+  }
+  update(dt) { this.baseUpdate(dt); }
+  draw(ctx) {
+    const W = Game.width, H = Game.height;
+    this.drawBackground(ctx);
+
+    // 連線（鎖鏈）
+    ctx.strokeStyle = 'rgba(255, 200, 100, 0.5)';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 4]);
+    for (let i = 0; i < this.connections.length; i++) {
+      const from = this.fireballs[i];
+      for (const j of this.connections[i]) {
+        const to = this.fireballs[j];
+        ctx.beginPath();
+        ctx.moveTo(from.x, from.y);
+        ctx.lineTo(to.x, to.y);
+        ctx.stroke();
+        // 箭頭
+        const ang = Math.atan2(to.y - from.y, to.x - from.x);
+        const mx = (from.x + to.x) / 2;
+        const my = (from.y + to.y) / 2;
+        ctx.fillStyle = 'rgba(255, 200, 100, 0.8)';
+        ctx.beginPath();
+        ctx.moveTo(mx + Math.cos(ang)*8, my + Math.sin(ang)*8);
+        ctx.lineTo(mx + Math.cos(ang+2.5)*6, my + Math.sin(ang+2.5)*6);
+        ctx.lineTo(mx + Math.cos(ang-2.5)*6, my + Math.sin(ang-2.5)*6);
+        ctx.closePath(); ctx.fill();
+      }
+    }
+    ctx.setLineDash([]);
+
+    // 火球
+    for (const f of this.fireballs) {
+      if (f.exploding) {
+        const t = this.time - f.explodeTime;
+        const r = Math.min(t * 80, 50);
+        const a = Math.max(0, 1 - t * 0.8);
+        // 爆炸圈
+        for (let k = 0; k < 3; k++) {
+          ctx.fillStyle = `rgba(${[255,255,255][k]}, ${[150,200,235][k]}, ${[50,50,59][k]}, ${a*(0.8-k*0.2)})`;
+          ctx.beginPath(); ctx.arc(f.x, f.y, Math.max(1, r - k*5), 0, Math.PI*2); ctx.fill();
+        }
+      } else {
+        // 火球
+        const pulse = 1 + Math.sin(this.time*4 + f.idx) * 0.08;
+        const grad = ctx.createRadialGradient(f.x-5, f.y-5, 0, f.x, f.y, 28*pulse);
+        grad.addColorStop(0, '#ffeb3b');
+        grad.addColorStop(0.5, '#ff5722');
+        grad.addColorStop(1, '#7f0000');
+        ctx.fillStyle = grad;
+        ctx.beginPath(); ctx.arc(f.x, f.y, 28*pulse, 0, Math.PI*2); ctx.fill();
+        // 編號（用打亂後的 label，不是 idx）
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 18px -apple-system, "PingFang TC"';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(`${this.labels[f.idx]}`, f.x, f.y);
+        ctx.textBaseline = 'alphabetic';
+      }
+    }
+
+    if (this.cat) this.cat.draw(ctx);
+    this.drawForeground(ctx);
+    this.drawHeader(ctx, '🔥 火之大陸 — 第 5 關 鎖鏈火球',
+      '箭頭代表「會引爆」。點哪一顆能炸光全部？');
+    this.drawBackBtn(ctx);
+    this.drawFeedback(ctx);
+
+    if (this.showHintCard) {
+      this.drawHintCard(ctx, '💡 連鎖反應', [
+        '一個動作會引發另一個動作',
+        '這就是「連鎖反應」：',
+        '🎳 推倒第一個保齡球瓶',
+        '   會撞倒後面所有瓶子',
+        '🦠 一個人感冒會傳染給很多人',
+        '',
+        '✨ 「想清楚再行動」',
+        '是聰明人的習慣！',
+      ]);
+    }
+    if (this.showWinCard) this.drawWinCard(ctx, '連鎖爆炸成功！');
+    this.drawEnterFade(ctx);
+  }
+}
+
+/* ============================================================
+   🐲 第 6 關：烈焰魔王（三階段 BOSS 戰，整合所有技巧）
+   ============================================================ */
+class FireBossScene extends FireLevelBase {
+  constructor() {
+    super(6);
+    this.boss = null;
+    this.bossPhase = 1;            // 1, 2, 3
+    this.bossHP = 3;
+    this.bossMaxHP = 3;
+    this.flashTime = 0;            // boss 受擊閃白
+    this.bossDying = false;
+    this.bossDieTime = 0;
+    this.attackCooldown = 0;       // boss 出招冷卻
+    this.fireballs = [];           // boss 噴出的火球（裝飾）
+    this.phaseHint = '';
+    this.phaseHintTimer = 0;
+
+    // 階段道具
+    // P1：因果（用水冷卻盾） - 4 道具選 1
+    // P2：順序（先冰再風） - 2 步驟
+    // P3：剛剛好（控制溫度） - 動態
+    this.p1Items = [
+      { id: 'wood',  icon: '🪵', name: '木頭', x: 0, y: 0, used: false, correct: false },
+      { id: 'rock',  icon: '🪨', name: '石頭', x: 0, y: 0, used: false, correct: false },
+      { id: 'wind',  icon: '🌬️', name: '風箱', x: 0, y: 0, used: false, correct: false },
+      { id: 'water', icon: '💧', name: '水',   x: 0, y: 0, used: false, correct: true },
+    ];
+    this.p2Items = [
+      { id: 'rock',  icon: '🪨', name: '石頭', x: 0, y: 0, used: false },
+      { id: 'wind',  icon: '🌬️', name: '風箱', x: 0, y: 0, used: false },
+      { id: 'water', icon: '💧', name: '水',   x: 0, y: 0, used: false },
+      { id: 'ice',   icon: '❄️', name: '冰塊', x: 0, y: 0, used: false },
+    ];
+    this.p2Step = 1;
+    // P3 用按鈕控制
+    this.bossHeat = 60;
+    this.heating = false;
+    this.cooling = false;
+    this.coolProgress = 0;
+  }
+  layout() {
+    this.baseLayout();
+    const W = Game.width, H = Game.height;
+    this.bossX = W * 0.65;
+    this.bossY = H * 0.35;
+    // 道具列
+    const layoutItems = (items) => {
+      const itemY = H - 80;
+      const totalW = Math.min(W * 0.75, 480);
+      const startX = (W - totalW) / 2;
+      const step = totalW / (items.length - 1);
+      items.forEach((it, i) => { it.x = startX + i * step; it.y = itemY; it.r = 36; });
+    };
+    layoutItems(this.p1Items);
+    layoutItems(this.p2Items);
+  }
+  onResize() { this.layout(); if (this.cat) { this.cat.x = this.catStartX; this.cat.y = this.groundY; } }
+  showPhaseHint(text) {
+    this.phaseHint = text;
+    this.phaseHintTimer = 3.0;
+  }
+  onEnter() {
+    this.showPhaseHint('🐲 烈焰魔王來襲！\n他被火盾包住，想想之前學過什麼能破解');
+  }
+  onTap(x, y) {
+    if (this.baseTap(x, y) !== null) return;
+    if (this.bossDying) return;
+
+    if (this.bossPhase === 1) {
+      for (const it of this.p1Items) {
+        if (it.used) continue;
+        const dx = x - it.x, dy = y - it.y;
+        if (dx*dx + dy*dy < it.r*it.r) {
+          if (it.correct) {
+            it.used = true;
+            this.damageBoss();
+            this.showFeedback('💧 水蓋過火盾！魔王受傷', '#4fc3f7');
+            setTimeout(() => {
+              this.bossPhase = 2;
+              this.showPhaseHint('🐲 第 2 階段：他開始噴火咆哮！\n單一道具不夠，要照順序兩步驟才能封住');
+            }, 1200);
+          } else {
+            this.showFeedback('❌ 沒用！火盾沒破，再想想', '#ff7043');
+          }
+          return;
+        }
+      }
+    }
+    else if (this.bossPhase === 2) {
+      for (const it of this.p2Items) {
+        if (it.used) continue;
+        const dx = x - it.x, dy = y - it.y;
+        if (dx*dx + dy*dy < it.r*it.r) {
+          if (this.p2Step === 1 && it.id === 'ice') {
+            it.used = true;
+            this.p2Step = 2;
+            this.showFeedback('❄️ 火變弱了！再吹熄它', '#4fc3f7');
+          } else if (this.p2Step === 2 && it.id === 'wind') {
+            it.used = true;
+            this.damageBoss();
+            this.showFeedback('🌬️ 風吹熄殘火！魔王再受重創', '#81c784');
+            setTimeout(() => {
+              this.bossPhase = 3;
+              this.bossHeat = 30;
+              this.showPhaseHint('🐲 最終階段：魔王體溫失控\n讓他穩定在綠色區域才能徹底制服他');
+            }, 1200);
+          } else {
+            this.showFeedback('❌ 順序錯了！想想步驟', '#ff7043');
+          }
+          return;
+        }
+      }
+    }
+    else if (this.bossPhase === 3) {
+      const W = Game.width, H = Game.height;
+      const btnY = H - 80;
+      const btnHeat = { x: W*0.35, y: btnY, r: 42 };
+      const btnCool = { x: W*0.65, y: btnY, r: 42 };
+      const dh = x - btnHeat.x, dh2 = y - btnHeat.y;
+      const dc = x - btnCool.x, dc2 = y - btnCool.y;
+      if (dh*dh + dh2*dh2 < btnHeat.r*btnHeat.r) { this.heating = true; this.cooling = false; }
+      else if (dc*dc + dc2*dc2 < btnCool.r*btnCool.r) { this.cooling = true; this.heating = false; }
+      else { this.heating = false; this.cooling = false; }
+    }
+  }
+  damageBoss() {
+    this.bossHP--;
+    this.flashTime = 0.4;
+    if (this.bossHP <= 0) {
+      this.bossDying = true;
+      this.bossDieTime = this.time;
+      this.showFeedback('🎊 烈焰魔王被打敗了！', '#ffd700');
+      setTimeout(() => this.startWalk(), 2200);
+    }
+  }
+  update(dt) {
+    this.baseUpdate(dt);
+    if (this.flashTime > 0) this.flashTime -= dt;
+    if (this.phaseHintTimer > 0) this.phaseHintTimer -= dt;
+
+    // P3：溫度控制
+    if (this.bossPhase === 3 && !this.bossDying) {
+      if (this.heating) this.bossHeat = Math.min(100, this.bossHeat + 30 * dt);
+      else if (this.cooling) this.bossHeat = Math.max(0, this.bossHeat - 30 * dt);
+      else this.bossHeat += (60 - this.bossHeat) * dt * 0.4;
+
+      // 在綠區（40~60）累積冷卻進度
+      if (this.bossHeat >= 40 && this.bossHeat <= 60) {
+        this.coolProgress += dt * 25;
+        if (this.coolProgress >= 100) {
+          this.coolProgress = 100;
+          this.damageBoss();
+        }
+      } else {
+        this.coolProgress = Math.max(0, this.coolProgress - dt * 10);
+      }
+    }
+
+    // boss 偶爾出招（裝飾火球）
+    this.attackCooldown -= dt;
+    if (this.attackCooldown <= 0 && !this.bossDying) {
+      this.attackCooldown = 1.5 + Math.random();
+      this.fireballs.push({
+        x: this.bossX, y: this.bossY,
+        vx: -100 - Math.random()*60, vy: -50 + Math.random()*100,
+        life: 0,
+      });
+    }
+    for (const fb of this.fireballs) {
+      fb.life += dt;
+      fb.x += fb.vx * dt;
+      fb.y += fb.vy * dt;
+      fb.vy += 80 * dt;
+    }
+    this.fireballs = this.fireballs.filter(f => f.life < 1.5 && f.y < Game.height);
+  }
+  draw(ctx) {
+    const W = Game.width, H = Game.height;
+    this.drawBackground(ctx);
+
+    // 魔王
+    if (!this.bossDying || this.time - this.bossDieTime < 2) {
+      this.drawBoss(ctx);
+    }
+
+    // boss 火球攻擊
+    for (const fb of this.fireballs) {
+      const grad = ctx.createRadialGradient(fb.x-3, fb.y-3, 0, fb.x, fb.y, 12);
+      grad.addColorStop(0, '#ffeb3b'); grad.addColorStop(1, '#ff5722');
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(fb.x, fb.y, 10, 0, Math.PI*2); ctx.fill();
+    }
+
+    // BOSS HP 條
+    if (!this.bossDying) {
+      const barW = 240, barH = 14;
+      const bx = W/2 - barW/2, by = 100;
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(bx, by, barW, barH);
+      ctx.fillStyle = '#e53935';
+      ctx.fillRect(bx, by, barW * (this.bossHP/this.bossMaxHP), barH);
+      ctx.strokeStyle = '#ffd700'; ctx.lineWidth = 2;
+      ctx.strokeRect(bx, by, barW, barH);
+      ctx.fillStyle = '#ffd700';
+      ctx.font = 'bold 11px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center';
+      ctx.fillText(`烈焰魔王 ❤️ ${this.bossHP}/${this.bossMaxHP}`, W/2, by - 4);
+    }
+
+    // 階段提示橫幅
+    if (this.phaseHintTimer > 0 && this.phaseHint) {
+      const a = Math.min(1, this.phaseHintTimer / 0.4);
+      ctx.save(); ctx.globalAlpha = a;
+      ctx.fillStyle = 'rgba(74, 20, 140, 0.92)';
+      const lines = this.phaseHint.split('\n');
+      const bh = 30 + lines.length * 22;
+      ctx.fillRect(0, H/2 - bh/2, W, bh);
+      ctx.fillStyle = '#ffd700';
+      ctx.font = 'bold 16px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center';
+      lines.forEach((line, i) => {
+        ctx.fillStyle = i === 0 ? '#ffd700' : '#fff';
+        ctx.font = i === 0 ? 'bold 18px -apple-system, "PingFang TC"' : '14px -apple-system, "PingFang TC"';
+        ctx.fillText(line, W/2, H/2 - bh/2 + 25 + i * 22);
+      });
+      ctx.restore();
+    }
+
+    if (this.cat) this.cat.draw(ctx);
+    this.drawForeground(ctx);
+
+    // 階段對應 UI
+    if (!this.bossDying) {
+      if (this.bossPhase === 1) this.drawP1UI(ctx);
+      else if (this.bossPhase === 2) this.drawP2UI(ctx);
+      else if (this.bossPhase === 3) this.drawP3UI(ctx);
+    }
+
+    // 標題
+    this.drawHeader(ctx, '🐲 火之大陸 — 烈焰魔王', `階段 ${this.bossPhase}/3`);
+    this.drawBackBtn(ctx);
+    this.drawFeedback(ctx);
+
+    if (this.showHintCard) {
+      this.drawHintCard(ctx, '💡 你打敗了魔王！', [
+        '這場戰鬥用到了所有你學的技巧：',
+        '🧠 第 1 階段 → 因果推理（水滅火）',
+        '🧠 第 2 階段 → 順序步驟（冰再風）',
+        '🧠 第 3 階段 → 平衡控制（剛剛好）',
+        '',
+        '✨ 真正的高手不只記答案',
+        '✨ 是會把學會的道理組合起來用',
+        '',
+        '🎊 火之大陸冒險結束！',
+      ]);
+    }
+    if (this.showWinCard) this.drawWinCard(ctx, '🎊 火之大陸通關！');
+    this.drawEnterFade(ctx);
+  }
+  drawBoss(ctx) {
+    const bx = this.bossX, by = this.bossY;
+    const time = this.time;
+    let dyingScale = 1;
+    let dyingAlpha = 1;
+    if (this.bossDying) {
+      const t = time - this.bossDieTime;
+      dyingScale = 1 + t * 0.3;
+      dyingAlpha = Math.max(0, 1 - t / 2);
+    }
+    const flash = Math.max(0, this.flashTime / 0.4);
+    ctx.save();
+    ctx.globalAlpha = dyingAlpha;
+    ctx.translate(bx, by);
+    ctx.scale(dyingScale, dyingScale);
+    const bob = Math.sin(time * 2) * 5;
+    ctx.translate(0, bob);
+
+    // 火盾（階段 1）
+    if (this.bossPhase === 1 && !this.bossDying) {
+      const sr = 80 + Math.sin(time*3) * 8;
+      ctx.fillStyle = `rgba(255, 87, 34, ${0.3+Math.sin(time*4)*0.2})`;
+      ctx.beginPath(); ctx.arc(0, 0, sr, 0, Math.PI*2); ctx.fill();
+      // 火盾紋
+      ctx.strokeStyle = `rgba(255, 215, 0, 0.8)`;
+      ctx.lineWidth = 2;
+      for (let k = 0; k < 8; k++) {
+        const ang = time * 0.3 + k * Math.PI / 4;
+        ctx.beginPath();
+        ctx.arc(0, 0, sr - 4, ang, ang + 0.3);
+        ctx.stroke();
+      }
+    }
+
+    // 龍身（紫黑色）
+    const bodyColor = flash > 0 ? '#fff' : '#3a0a3a';
+    ctx.fillStyle = bodyColor;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 50, 40, 0, 0, Math.PI*2);
+    ctx.fill();
+    // 翅膀
+    ctx.fillStyle = flash > 0 ? '#fff' : '#7b1fa2';
+    ctx.beginPath();
+    ctx.ellipse(-50, -10, 30, 20, -0.5 + Math.sin(time*3)*0.2, 0, Math.PI*2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(50, -10, 30, 20, 0.5 - Math.sin(time*3)*0.2, 0, Math.PI*2);
+    ctx.fill();
+    // 眼睛（紅）
+    ctx.fillStyle = flash > 0 ? '#fff' : '#ff1744';
+    ctx.beginPath(); ctx.arc(-15, -8, 7, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(15, -8, 7, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#000';
+    ctx.beginPath(); ctx.arc(-15, -8, 3, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(15, -8, 3, 0, Math.PI*2); ctx.fill();
+    // 嘴
+    ctx.fillStyle = '#7f0000';
+    ctx.beginPath();
+    ctx.ellipse(0, 12, 18, 8, 0, 0, Math.PI);
+    ctx.fill();
+    // 牙
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.moveTo(-8, 12); ctx.lineTo(-5, 20); ctx.lineTo(-2, 12);
+    ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(2, 12); ctx.lineTo(5, 20); ctx.lineTo(8, 12);
+    ctx.closePath(); ctx.fill();
+    // 角
+    ctx.fillStyle = flash > 0 ? '#fff' : '#ffd700';
+    ctx.beginPath();
+    ctx.moveTo(-20, -30); ctx.lineTo(-15, -50); ctx.lineTo(-10, -30);
+    ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(20, -30); ctx.lineTo(15, -50); ctx.lineTo(10, -30);
+    ctx.closePath(); ctx.fill();
+
+    ctx.restore();
+  }
+  drawP1UI(ctx) { this.drawItemRow(ctx, this.p1Items); }
+  drawP2UI(ctx) {
+    this.drawItemRow(ctx, this.p2Items);
+    // 步驟提示
+    const W = Game.width;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(W/2 - 90, 130, 180, 22);
+    ctx.fillStyle = this.p2Step === 1 ? '#4fc3f7' : '#81c784';
+    ctx.font = 'bold 13px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText(`步驟 ${this.p2Step}/2：` + (this.p2Step === 1 ? '先讓火變弱' : '把殘火吹熄'), W/2, 145);
+  }
+  drawP3UI(ctx) {
+    const W = Game.width, H = Game.height;
+
+    // 進度條
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(W/2 - 80, 130, 160, 14);
+    ctx.fillStyle = '#4caf50';
+    ctx.fillRect(W/2 - 80, 130, 160 * (this.coolProgress/100), 14);
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
+    ctx.strokeRect(W/2 - 80, 130, 160, 14);
+    ctx.fillStyle = '#fff';
+    ctx.font = '11px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText('冷卻中...', W/2, 126);
+
+    // 溫度計
+    const tcX = W * 0.85;
+    const tcY = H * 0.5;
+    const tcH = 200;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(tcX - 18, tcY - tcH/2, 36, tcH);
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+    ctx.strokeRect(tcX - 18, tcY - tcH/2, 36, tcH);
+    const minY = tcY + tcH/2 - tcH * 0.4;
+    const maxY = tcY + tcH/2 - tcH * 0.6;
+    ctx.fillStyle = 'rgba(76, 175, 80, 0.4)';
+    ctx.fillRect(tcX - 18, maxY, 36, minY - maxY);
+    const heatY = tcY + tcH/2 - tcH * (this.bossHeat/100);
+    let heatColor = '#ffd700';
+    if (this.bossHeat > 60) heatColor = '#ff5252';
+    else if (this.bossHeat < 40) heatColor = '#4fc3f7';
+    else heatColor = '#4caf50';
+    ctx.fillStyle = heatColor;
+    ctx.fillRect(tcX - 14, heatY, 28, tcY + tcH/2 - heatY);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 10px -apple-system';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${Math.floor(this.bossHeat)}°`, tcX, heatY - 6);
+    ctx.fillStyle = '#4caf50';
+    ctx.fillText('剛好', tcX + 28, (minY + maxY)/2 + 4);
+
+    // 按鈕
+    const btnY = H - 80;
+    [
+      { x: W*0.35, label: '🔥 加熱', color: '#ff5722', active: this.heating },
+      { x: W*0.65, label: '❄️ 降溫', color: '#03a9f4', active: this.cooling },
+    ].forEach(btn => {
+      ctx.fillStyle = btn.active ? btn.color : 'rgba(255,255,255,0.15)';
+      ctx.beginPath(); ctx.arc(btn.x, btnY, 42, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = btn.color; ctx.lineWidth = 3; ctx.stroke();
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 14px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(btn.label, btn.x, btnY);
+      ctx.textBaseline = 'alphabetic';
+    });
+  }
+  drawItemRow(ctx, items) {
+    const W = Game.width, H = Game.height;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0, H-110, W, 110);
+    for (const it of items) {
+      const wobble = it.used ? 0 : Math.sin(this.time*2 + it.x*0.01) * 2;
+      ctx.fillStyle = it.used ? 'rgba(50,50,50,0.4)' : 'rgba(255,255,255,0.15)';
+      ctx.beginPath(); ctx.arc(it.x, it.y + wobble, it.r, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = it.used ? 'rgba(100,100,100,0.3)' : 'rgba(255,215,0,0.5)';
+      ctx.lineWidth = 2; ctx.stroke();
+      ctx.font = '32px -apple-system';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.globalAlpha = it.used ? 0.3 : 1;
+      ctx.fillText(it.icon, it.x, it.y + wobble);
+      ctx.globalAlpha = 1;
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = it.used ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.85)';
+      ctx.font = '12px -apple-system, "PingFang TC"';
+      ctx.fillText(it.name, it.x, it.y + it.r + 16 + wobble);
+    }
+  }
+}
+
+/* ============================================================
+   💧 水之大陸地圖（關卡選擇）
+   ============================================================ */
+class WaterMapScene {
+  constructor() {
+    this.name = 'WaterMap';
+    this.time = 0;
+    this.bubbles = [];
+    this.cat = null;
+    this.enterAlpha = 1;
+    this.enterTween = new Tween(1, 0, 0.6, Easing.easeOutCubic);
+    this.backBtn = { x: 50, y: 30, r: 22 };
+    this.levels = [];
+  }
+  enter() {
+    this.layout();
+    this.cat = new PixelCat(Game.width * 0.5, Game.height * 0.85);
+    this.cat.scale = 2;
+    for (let i = 0; i < 30; i++) {
+      this.bubbles.push({
+        x: Math.random()*Game.width,
+        y: Math.random()*Game.height + Game.height,
+        vy: -20-Math.random()*40,
+        size: 2+Math.random()*5,
+        life: Math.random(),
+      });
+    }
+  }
+  onResize() { this.layout(); }
+  layout() {
+    const W = Game.width, H = Game.height;
+    const lv = Game.progress.waterLevel || 0;
+    this.levels = [
+      { num: 1, name: '閘門順序', x: W*0.25, y: H*0.55, cleared: lv>=1, unlocked: true,    r: 36 },
+      { num: 2, name: '?', x: W*0.42, y: H*0.42, cleared: lv>=2, unlocked: lv>=1, r: 36, locked: lv<1 },
+      { num: 3, name: '?', x: W*0.58, y: H*0.55, cleared: lv>=3, unlocked: lv>=2, r: 36, locked: lv<2 },
+      { num: 4, name: '?', x: W*0.75, y: H*0.42, cleared: lv>=4, unlocked: lv>=3, r: 36, locked: lv<3 },
+    ];
+  }
+  onTap(x, y) {
+    const bx = x - this.backBtn.x, by = y - this.backBtn.y;
+    if (bx*bx + by*by < this.backBtn.r * this.backBtn.r) {
+      Game.changeScene(new WorldMapScene()); return;
+    }
+    for (const lv of this.levels) {
+      if (!lv.unlocked) continue;
+      const dx = x - lv.x, dy = y - lv.y;
+      if (dx*dx + dy*dy < lv.r*lv.r) {
+        if (lv.num === 1) Game.changeScene(new WaterLevel1Scene());
+        return;
+      }
+    }
+  }
+  update(dt) {
+    this.time += dt;
+    this.enterAlpha = this.enterTween.update(dt);
+    if (this.cat) this.cat.update(dt);
+    for (const b of this.bubbles) {
+      b.y += b.vy * dt;
+      if (b.y < -20) {
+        b.y = Game.height + 20;
+        b.x = Math.random() * Game.width;
+      }
+    }
+  }
+  draw(ctx) {
+    const W = Game.width, H = Game.height;
+    // 海底漸層
+    const sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, '#0a3a6a'); sky.addColorStop(0.5, '#1565c0');
+    sky.addColorStop(0.9, '#0a4a8a'); sky.addColorStop(1, '#062040');
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+
+    // 光線從上往下（散射光）
+    for (let i = 0; i < 5; i++) {
+      const lx = (i + 0.5) * W / 5 + Math.sin(this.time*0.5 + i) * 30;
+      const grad = ctx.createLinearGradient(lx, 0, lx, H*0.6);
+      grad.addColorStop(0, 'rgba(180,220,255,0.15)');
+      grad.addColorStop(1, 'rgba(180,220,255,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.moveTo(lx - 50, 0); ctx.lineTo(lx + 50, 0);
+      ctx.lineTo(lx + 100, H*0.6); ctx.lineTo(lx - 100, H*0.6);
+      ctx.closePath(); ctx.fill();
+    }
+
+    // 遠方珊瑚剪影
+    ctx.fillStyle = '#062a4a';
+    for (let i = 0; i < 6; i++) {
+      const cx = W * (i+0.5) / 6;
+      const ch = 60 + Math.sin(i*1.7) * 20;
+      ctx.beginPath();
+      ctx.moveTo(cx-30, H*0.7);
+      ctx.quadraticCurveTo(cx-25, H*0.7-ch*0.7, cx-15, H*0.7-ch);
+      ctx.quadraticCurveTo(cx, H*0.7-ch*1.2, cx+15, H*0.7-ch);
+      ctx.quadraticCurveTo(cx+25, H*0.7-ch*0.7, cx+30, H*0.7);
+      ctx.closePath(); ctx.fill();
+    }
+
+    // 海底地面
+    const gd = ctx.createLinearGradient(0, H*0.7, 0, H);
+    gd.addColorStop(0, '#0d4a8a'); gd.addColorStop(1, '#062040');
+    ctx.fillStyle = gd;
+    ctx.fillRect(0, H*0.7, W, H*0.3);
+
+    // 路徑
+    ctx.strokeStyle = 'rgba(150,220,255,0.4)';
+    ctx.lineWidth = 3;
+    ctx.setLineDash([8, 8]);
+    ctx.beginPath();
+    ctx.moveTo(this.cat.x, this.cat.y - 30);
+    for (let i = 0; i < this.levels.length; i++) {
+      const lv = this.levels[i];
+      if (i === 0) ctx.lineTo(lv.x, lv.y);
+      else {
+        const prev = this.levels[i-1];
+        const mx = (prev.x + lv.x) / 2;
+        const my = (prev.y + lv.y) / 2 + (i % 2 === 0 ? 30 : -30);
+        ctx.quadraticCurveTo(mx, my, lv.x, lv.y);
+      }
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 關卡圖示
+    for (const lv of this.levels) {
+      const bob = Math.sin(this.time*2 + lv.num) * 4;
+      const cy = lv.y + bob;
+      if (lv.unlocked && !lv.cleared) {
+        ctx.fillStyle = `rgba(100,200,255,${0.25+Math.sin(this.time*3+lv.num)*0.2})`;
+        ctx.beginPath(); ctx.arc(lv.x, cy, lv.r+18, 0, Math.PI*2); ctx.fill();
+      }
+      const grad = ctx.createRadialGradient(lv.x, cy, 0, lv.x, cy, lv.r);
+      if (lv.cleared) { grad.addColorStop(0, '#ffd700'); grad.addColorStop(1, '#b8860b'); }
+      else if (lv.unlocked) { grad.addColorStop(0, '#03a9f4'); grad.addColorStop(1, '#01579b'); }
+      else { grad.addColorStop(0, '#1a3a5a'); grad.addColorStop(1, '#0a1a2a'); }
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(lv.x, cy, lv.r, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = lv.cleared ? '#fff8d0' : (lv.unlocked ? '#81d4fa' : '#3a4a5a');
+      ctx.lineWidth = 3; ctx.stroke();
+      ctx.fillStyle = lv.unlocked ? '#fff' : 'rgba(255,255,255,0.3)';
+      ctx.font = 'bold 28px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(lv.unlocked ? `${lv.num}` : '🔒', lv.x, cy);
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = lv.unlocked ? 'rgba(255,255,255,0.85)' : 'rgba(255,255,255,0.3)';
+      ctx.font = '13px -apple-system, "PingFang TC"';
+      ctx.fillText(lv.name, lv.x, cy + lv.r + 22);
+      if (lv.cleared) {
+        ctx.fillStyle = '#4caf50';
+        ctx.beginPath(); ctx.arc(lv.x+lv.r-8, cy-lv.r+8, 11, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 14px -apple-system';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('✓', lv.x+lv.r-8, cy-lv.r+9);
+        ctx.textBaseline = 'alphabetic';
+      }
+    }
+
+    if (this.cat) this.cat.draw(ctx);
+
+    // 氣泡
+    for (const b of this.bubbles) {
+      ctx.fillStyle = `rgba(180,220,255,${0.3+b.life*0.4})`;
+      ctx.beginPath(); ctx.arc(b.x + Math.sin(this.time*2+b.life*10)*5, b.y, b.size, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+      ctx.lineWidth = 0.5; ctx.stroke();
+    }
+
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(W/2 - 110, 16, 220, 36);
+    ctx.fillStyle = '#81d4fa';
+    ctx.font = 'bold 18px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText('💧 水之大陸 — 選擇關卡', W/2, 40);
+    const lv = Game.progress.waterLevel || 0;
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.font = '13px -apple-system, "PingFang TC"';
+    ctx.fillText(`進度：${lv} / 4 關（V1 僅開放第 1 關）`, W/2, 70);
+
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.beginPath();
+    ctx.arc(this.backBtn.x, this.backBtn.y, this.backBtn.r, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 22px -apple-system';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('←', this.backBtn.x, this.backBtn.y);
+    ctx.textBaseline = 'alphabetic';
+
+    if (this.enterAlpha > 0) {
+      ctx.fillStyle = `rgba(0,0,0,${this.enterAlpha})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+  }
+}
+
+/* ============================================================
+   💧 水之大陸第 1 關：閘門順序（順序步驟解謎）
+   說明：山頂的水源要引到山下村莊，路上有 3 個閘門。
+        依水路圖看出正確順序，依序點擊閘門 → 水成功流到村莊。
+   ============================================================ */
+class WaterLevel1Scene extends FireLevelBase {
+  constructor() {
+    super(1);
+    this.name = 'Water L1';
+    this.continent = 'water';
+    this.mapSceneClass = WaterMapScene;
+    this.gates = [];
+    // 正解順序：先 B，再 A，最後 C（看水流路徑就知道）
+    this.correctOrder = ['B', 'A', 'C'];
+    this.currentStep = 0;
+    this.bubbles = [];
+    this.waterAnim = 0;        // 水流推進進度
+    this.flowingTo = -1;       // 0,1,2,3 代表水流到第幾段
+  }
+  layout() {
+    this.baseLayout();
+    const W = Game.width, H = Game.height;
+    // 水路：從左上山頂 → 經過閘門 B → 閘門 A → 閘門 C → 右下村莊
+    // 但閘門擺位置要刻意打散（不依字母 ABC 順序排）
+    this.gates = [
+      { id: 'A', x: W*0.45, y: H*0.45, opened: false, label: 'A' },
+      { id: 'B', x: W*0.30, y: H*0.30, opened: false, label: 'B' },
+      { id: 'C', x: W*0.65, y: H*0.55, opened: false, label: 'C' },
+    ];
+    this.sourceX = W*0.12; this.sourceY = H*0.22;
+    this.villageX = W*0.85; this.villageY = H*0.72;
+    // 水路 path（B → A → C）
+    this.path = [
+      { x: this.sourceX, y: this.sourceY },
+      { x: W*0.20, y: H*0.30 },
+      { x: this.gates[1].x, y: this.gates[1].y },  // B
+      { x: W*0.38, y: H*0.42 },
+      { x: this.gates[0].x, y: this.gates[0].y },  // A
+      { x: W*0.55, y: H*0.55 },
+      { x: this.gates[2].x, y: this.gates[2].y },  // C
+      { x: W*0.78, y: H*0.65 },
+      { x: this.villageX, y: this.villageY },
+    ];
+  }
+  onResize() { this.layout(); if (this.cat) { this.cat.x = this.catStartX; this.cat.y = this.groundY; } }
+  onEnter() {
+    for (let i = 0; i < 20; i++) {
+      this.bubbles.push({
+        x: Math.random()*Game.width, y: Math.random()*Game.height,
+        vy: -10-Math.random()*20, size: 2+Math.random()*4,
+        life: Math.random(),
+      });
+    }
+  }
+  onTap(x, y) {
+    if (this.baseTap(x, y) !== null) return;
+    for (const g of this.gates) {
+      if (g.opened) continue;
+      const dx = x - g.x, dy = y - g.y;
+      if (dx*dx + dy*dy < 38*38) {
+        const expected = this.correctOrder[this.currentStep];
+        if (g.id === expected) {
+          g.opened = true;
+          this.currentStep++;
+          this.flowingTo = this.currentStep;
+          this.showFeedback(`✨ 對了！水流到 ${g.label} 閘門 (${this.currentStep}/3)`, '#81d4fa');
+          if (this.currentStep >= 3) {
+            // 過關
+            setTimeout(() => this.startWalk(this.villageX), 1500);
+          }
+        } else {
+          // 答錯：水溢出，所有閘門關閉重來
+          this.showFeedback('💦 水溢出來了！順序錯了，全部重來', '#ff7043');
+          for (const gg of this.gates) gg.opened = false;
+          this.currentStep = 0;
+          this.flowingTo = -1;
+          this.waterAnim = 0;
+        }
+        return;
+      }
+    }
+  }
+  update(dt) {
+    this.baseUpdate(dt);
+    // 水流推進動畫
+    if (this.flowingTo > 0) {
+      const target = this.flowingTo / 3;
+      this.waterAnim += (target - this.waterAnim) * dt * 4;
+    }
+    for (const b of this.bubbles) {
+      b.y += b.vy * dt;
+      if (b.y < 0) { b.y = Game.height; b.x = Math.random()*Game.width; }
+    }
+  }
+  drawBackground(ctx) {
+    const W = Game.width, H = Game.height;
+    // 海底漸層
+    const sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, '#0a3a6a'); sky.addColorStop(0.5, '#1976d2');
+    sky.addColorStop(1, '#0d4a8a');
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+    // 光線
+    for (let i = 0; i < 4; i++) {
+      const lx = (i + 0.5) * W / 4 + Math.sin(this.time*0.5 + i) * 20;
+      const grad = ctx.createLinearGradient(lx, 0, lx, H);
+      grad.addColorStop(0, 'rgba(180,220,255,0.12)');
+      grad.addColorStop(1, 'rgba(180,220,255,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.moveTo(lx - 40, 0); ctx.lineTo(lx + 40, 0);
+      ctx.lineTo(lx + 80, H); ctx.lineTo(lx - 80, H);
+      ctx.closePath(); ctx.fill();
+    }
+    // 地面
+    const gd = ctx.createLinearGradient(0, this.groundY, 0, H);
+    gd.addColorStop(0, '#0d4a8a'); gd.addColorStop(1, '#062040');
+    ctx.fillStyle = gd;
+    ctx.fillRect(0, this.groundY, W, H - this.groundY);
+  }
+  drawForeground(ctx) {
+    // 氣泡
+    for (const b of this.bubbles) {
+      ctx.fillStyle = `rgba(180,220,255,${0.3+b.life*0.3})`;
+      ctx.beginPath();
+      ctx.arc(b.x + Math.sin(this.time*2+b.life*10)*4, b.y, b.size, 0, Math.PI*2);
+      ctx.fill();
+    }
+    // 慶祝粒子
+    for (const p of this.successParticles) {
+      const a = 1 - (p.life / p.maxLife);
+      ctx.fillStyle = p.color; ctx.globalAlpha = a;
+      ctx.fillRect(p.x, p.y, p.size*2, p.size*2);
+    }
+    ctx.globalAlpha = 1;
+  }
+  draw(ctx) {
+    const W = Game.width, H = Game.height;
+    this.drawBackground(ctx);
+
+    // 水源（山頂的湧泉）
+    ctx.fillStyle = '#3a5a7a';
+    ctx.beginPath();
+    ctx.arc(this.sourceX, this.sourceY, 28, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#4fc3f7';
+    ctx.beginPath();
+    ctx.arc(this.sourceX, this.sourceY, 18, 0, Math.PI*2); ctx.fill();
+    // 水源閃爍
+    ctx.fillStyle = `rgba(255,255,255,${0.3+Math.sin(this.time*4)*0.2})`;
+    ctx.beginPath();
+    ctx.arc(this.sourceX-5, this.sourceY-5, 6, 0, Math.PI*2); ctx.fill();
+    // 水源標籤
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 13px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText('💧 水源', this.sourceX, this.sourceY - 36);
+
+    // 村莊（目的地）
+    ctx.fillStyle = '#5d4037';
+    ctx.fillRect(this.villageX-25, this.villageY-15, 50, 30);
+    ctx.fillStyle = '#8b4513';
+    ctx.beginPath();
+    ctx.moveTo(this.villageX-30, this.villageY-15);
+    ctx.lineTo(this.villageX, this.villageY-35);
+    ctx.lineTo(this.villageX+30, this.villageY-15);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#3a2010';
+    ctx.fillRect(this.villageX-6, this.villageY-5, 12, 18);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 13px -apple-system, "PingFang TC"';
+    ctx.fillText('🏘️ 村莊', this.villageX, this.villageY + 30);
+
+    // 水路（虛線管道，未流的部分）
+    ctx.strokeStyle = 'rgba(150,200,230,0.4)';
+    ctx.lineWidth = 8;
+    ctx.setLineDash([10, 6]);
+    ctx.beginPath();
+    ctx.moveTo(this.path[0].x, this.path[0].y);
+    for (let i = 1; i < this.path.length; i++) {
+      ctx.lineTo(this.path[i].x, this.path[i].y);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 已通水的水路（藍色實線 + 流動感）
+    if (this.waterAnim > 0) {
+      ctx.strokeStyle = '#4fc3f7';
+      ctx.lineWidth = 10;
+      ctx.lineCap = 'round';
+      // 計算當前已流到的位置
+      const segments = this.path.length - 1;
+      const totalProgress = this.waterAnim * segments;
+      ctx.beginPath();
+      ctx.moveTo(this.path[0].x, this.path[0].y);
+      let drawn = 0;
+      for (let i = 1; i < this.path.length && drawn < totalProgress; i++) {
+        if (drawn + 1 <= totalProgress) {
+          ctx.lineTo(this.path[i].x, this.path[i].y);
+          drawn++;
+        } else {
+          // 部分線段
+          const t = totalProgress - drawn;
+          const px = this.path[i-1].x + (this.path[i].x - this.path[i-1].x) * t;
+          const py = this.path[i-1].y + (this.path[i].y - this.path[i-1].y) * t;
+          ctx.lineTo(px, py);
+          drawn = totalProgress;
+        }
+      }
+      ctx.stroke();
+      // 水波亮點
+      ctx.strokeStyle = `rgba(255,255,255,${0.4+Math.sin(this.time*8)*0.3})`;
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(this.path[0].x, this.path[0].y);
+      let drawn2 = 0;
+      for (let i = 1; i < this.path.length && drawn2 < totalProgress; i++) {
+        if (drawn2 + 1 <= totalProgress) {
+          ctx.lineTo(this.path[i].x, this.path[i].y);
+          drawn2++;
+        } else {
+          const t = totalProgress - drawn2;
+          const px = this.path[i-1].x + (this.path[i].x - this.path[i-1].x) * t;
+          const py = this.path[i-1].y + (this.path[i].y - this.path[i-1].y) * t;
+          ctx.lineTo(px, py);
+          drawn2 = totalProgress;
+        }
+      }
+      ctx.stroke();
+      ctx.lineCap = 'butt';
+    }
+
+    // 閘門
+    for (const g of this.gates) {
+      const isNext = !g.opened && g.id === this.correctOrder[this.currentStep];
+      const pulse = isNext ? 1 + Math.sin(this.time*4)*0.1 : 1;
+      // 底座
+      ctx.fillStyle = '#3a2010';
+      ctx.fillRect(g.x - 30*pulse, g.y - 4, 60*pulse, 8);
+      // 閘門板
+      const gateColor = g.opened ? '#4caf50' : '#90a4ae';
+      ctx.fillStyle = gateColor;
+      const gateH = g.opened ? 20 : 50;
+      ctx.fillRect(g.x - 18*pulse, g.y - gateH, 36*pulse, gateH);
+      // 邊框
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(g.x - 18*pulse, g.y - gateH, 36*pulse, gateH);
+      // 字母
+      ctx.fillStyle = g.opened ? '#fff' : '#1a1a1a';
+      ctx.font = 'bold 22px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(g.label, g.x, g.y - gateH/2);
+      ctx.textBaseline = 'alphabetic';
+      // 已開啟標記
+      if (g.opened) {
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 14px -apple-system';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('✓', g.x, g.y - gateH - 14);
+        ctx.textBaseline = 'alphabetic';
+      }
+    }
+
+    if (this.cat) this.cat.draw(ctx);
+    this.drawForeground(ctx);
+    this.drawHeader(ctx, '💧 水之大陸 — 第 1 關 閘門順序',
+      `看水流方向找出開閘順序 (${this.currentStep}/3)`);
+    this.drawBackBtn(ctx);
+    this.drawFeedback(ctx);
+
+    if (this.showHintCard) {
+      this.drawHintCard(ctx, '💡 順序步驟', [
+        '想要水成功流到村莊，',
+        '必須照「水流的順序」開閘門：',
+        '',
+        '🌊 水從高處流到低處',
+        '🚪 水流到哪個閘門才能開哪個',
+        '',
+        '✨ 這就是「程式設計」的基本思維：',
+        '一步一步來，順序不能錯！',
+      ]);
+    }
+    if (this.showWinCard) this.drawWinCard(ctx, '水流到村莊了！');
+    this.drawEnterFade(ctx);
+  }
+}
+
+/* ============================================================
+   🌿 森林大陸地圖
+   ============================================================ */
+class ForestMapScene {
+  constructor() {
+    this.name = 'ForestMap';
+    this.time = 0;
+    this.leaves = [];
+    this.cat = null;
+    this.enterAlpha = 1;
+    this.enterTween = new Tween(1, 0, 0.6, Easing.easeOutCubic);
+    this.backBtn = { x: 50, y: 30, r: 22 };
+    this.levels = [];
+  }
+  enter() {
+    this.layout();
+    this.cat = new PixelCat(Game.width * 0.5, Game.height * 0.85);
+    this.cat.scale = 2;
+    for (let i = 0; i < 25; i++) {
+      this.leaves.push({
+        x: Math.random()*Game.width, y: Math.random()*Game.height,
+        vx: -10-Math.random()*15, vy: 10+Math.random()*20,
+        size: 3+Math.random()*4, rot: Math.random()*Math.PI*2,
+        color: ['#4caf50','#81c784','#a5d6a7','#ffeb3b','#ffa726'][Math.floor(Math.random()*5)],
+      });
+    }
+  }
+  onResize() { this.layout(); }
+  layout() {
+    const W = Game.width, H = Game.height;
+    const lv = Game.progress.forestLevel || 0;
+    this.levels = [
+      { num: 1, name: '果實分類', x: W*0.25, y: H*0.55, cleared: lv>=1, unlocked: true,    r: 36 },
+      { num: 2, name: '?', x: W*0.42, y: H*0.42, cleared: lv>=2, unlocked: lv>=1, r: 36 },
+      { num: 3, name: '?', x: W*0.58, y: H*0.55, cleared: lv>=3, unlocked: lv>=2, r: 36 },
+      { num: 4, name: '?', x: W*0.75, y: H*0.42, cleared: lv>=4, unlocked: lv>=3, r: 36 },
+    ];
+  }
+  onTap(x, y) {
+    const bx = x - this.backBtn.x, by = y - this.backBtn.y;
+    if (bx*bx + by*by < this.backBtn.r * this.backBtn.r) {
+      Game.changeScene(new WorldMapScene()); return;
+    }
+    for (const lv of this.levels) {
+      if (!lv.unlocked) continue;
+      const dx = x - lv.x, dy = y - lv.y;
+      if (dx*dx + dy*dy < lv.r*lv.r) {
+        if (lv.num === 1) Game.changeScene(new ForestLevel1Scene());
+        return;
+      }
+    }
+  }
+  update(dt) {
+    this.time += dt;
+    this.enterAlpha = this.enterTween.update(dt);
+    if (this.cat) this.cat.update(dt);
+    for (const l of this.leaves) {
+      l.x += l.vx * dt;
+      l.y += l.vy * dt;
+      l.rot += dt * 2;
+      if (l.x < -20 || l.y > Game.height + 20) {
+        l.x = Game.width + 20; l.y = -20;
+      }
+    }
+  }
+  draw(ctx) {
+    const W = Game.width, H = Game.height;
+    // 森林漸層
+    const sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, '#1b5e20'); sky.addColorStop(0.4, '#2e7d32');
+    sky.addColorStop(0.8, '#388e3c'); sky.addColorStop(1, '#1b5e20');
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+
+    // 樹木剪影（深色背景樹）
+    ctx.fillStyle = '#0d3a10';
+    for (let i = 0; i < 8; i++) {
+      const tx = W * (i+0.5) / 8 + Math.sin(i*1.7) * 30;
+      const th = 100 + Math.sin(i*2.3) * 30;
+      // 樹幹
+      ctx.fillRect(tx-6, H*0.5, 12, H*0.2);
+      // 樹冠
+      ctx.beginPath();
+      ctx.arc(tx, H*0.5 - th*0.3, th*0.5, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath();
+      ctx.arc(tx-th*0.3, H*0.5 - th*0.1, th*0.4, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath();
+      ctx.arc(tx+th*0.3, H*0.5 - th*0.1, th*0.4, 0, Math.PI*2); ctx.fill();
+    }
+
+    // 地面（深綠色）
+    const gd = ctx.createLinearGradient(0, H*0.7, 0, H);
+    gd.addColorStop(0, '#2e5b1f'); gd.addColorStop(1, '#1a3a10');
+    ctx.fillStyle = gd;
+    ctx.fillRect(0, H*0.7, W, H*0.3);
+    // 草點裝飾
+    ctx.fillStyle = '#4caf50';
+    for (let i = 0; i < 30; i++) {
+      const gx = (i * 47) % W;
+      const gy = H*0.7 + (i*23) % (H*0.3 - 5);
+      ctx.fillRect(gx, gy, 2, 5);
+    }
+
+    // 路徑
+    ctx.strokeStyle = 'rgba(200,255,150,0.4)';
+    ctx.lineWidth = 3;
+    ctx.setLineDash([8, 8]);
+    ctx.beginPath();
+    ctx.moveTo(this.cat.x, this.cat.y - 30);
+    for (let i = 0; i < this.levels.length; i++) {
+      const lv = this.levels[i];
+      if (i === 0) ctx.lineTo(lv.x, lv.y);
+      else {
+        const prev = this.levels[i-1];
+        const mx = (prev.x + lv.x) / 2;
+        const my = (prev.y + lv.y) / 2 + (i % 2 === 0 ? 30 : -30);
+        ctx.quadraticCurveTo(mx, my, lv.x, lv.y);
+      }
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 關卡圖示
+    for (const lv of this.levels) {
+      const bob = Math.sin(this.time*2 + lv.num) * 4;
+      const cy = lv.y + bob;
+      if (lv.unlocked && !lv.cleared) {
+        ctx.fillStyle = `rgba(150,255,100,${0.25+Math.sin(this.time*3+lv.num)*0.2})`;
+        ctx.beginPath(); ctx.arc(lv.x, cy, lv.r+18, 0, Math.PI*2); ctx.fill();
+      }
+      const grad = ctx.createRadialGradient(lv.x, cy, 0, lv.x, cy, lv.r);
+      if (lv.cleared) { grad.addColorStop(0, '#ffd700'); grad.addColorStop(1, '#b8860b'); }
+      else if (lv.unlocked) { grad.addColorStop(0, '#66bb6a'); grad.addColorStop(1, '#1b5e20'); }
+      else { grad.addColorStop(0, '#1a3a10'); grad.addColorStop(1, '#0a1a05'); }
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(lv.x, cy, lv.r, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = lv.cleared ? '#fff8d0' : (lv.unlocked ? '#a5d6a7' : '#3a4a3a');
+      ctx.lineWidth = 3; ctx.stroke();
+      ctx.fillStyle = lv.unlocked ? '#fff' : 'rgba(255,255,255,0.3)';
+      ctx.font = 'bold 28px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(lv.unlocked ? `${lv.num}` : '🔒', lv.x, cy);
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = lv.unlocked ? 'rgba(255,255,255,0.85)' : 'rgba(255,255,255,0.3)';
+      ctx.font = '13px -apple-system, "PingFang TC"';
+      ctx.fillText(lv.name, lv.x, cy + lv.r + 22);
+      if (lv.cleared) {
+        ctx.fillStyle = '#4caf50';
+        ctx.beginPath(); ctx.arc(lv.x+lv.r-8, cy-lv.r+8, 11, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 14px -apple-system'; ctx.textBaseline = 'middle';
+        ctx.fillText('✓', lv.x+lv.r-8, cy-lv.r+9);
+        ctx.textBaseline = 'alphabetic';
+      }
+    }
+
+    if (this.cat) this.cat.draw(ctx);
+
+    // 飄落葉子
+    for (const l of this.leaves) {
+      ctx.save();
+      ctx.translate(l.x, l.y);
+      ctx.rotate(l.rot);
+      ctx.fillStyle = l.color;
+      ctx.fillRect(-l.size, -l.size*0.5, l.size*2, l.size);
+      ctx.restore();
+    }
+
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(W/2 - 110, 16, 220, 36);
+    ctx.fillStyle = '#a5d6a7';
+    ctx.font = 'bold 18px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText('🌿 森林大陸 — 選擇關卡', W/2, 40);
+    const lv = Game.progress.forestLevel || 0;
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.font = '13px -apple-system, "PingFang TC"';
+    ctx.fillText(`進度：${lv} / 4 關（V1 僅開放第 1 關）`, W/2, 70);
+
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.beginPath();
+    ctx.arc(this.backBtn.x, this.backBtn.y, this.backBtn.r, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 22px -apple-system';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('←', this.backBtn.x, this.backBtn.y);
+    ctx.textBaseline = 'alphabetic';
+
+    if (this.enterAlpha > 0) {
+      ctx.fillStyle = `rgba(0,0,0,${this.enterAlpha})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+  }
+}
+
+/* ============================================================
+   🌿 森林大陸第 1 關：果實分類（多重條件分類）
+   說明：6 顆果實要按「顏色 + 形狀」雙條件分到 4 個籃子
+        例：紅色+圓形 → 籃子 1，藍色+方形 → 籃子 4
+   ============================================================ */
+class ForestLevel1Scene extends FireLevelBase {
+  constructor() {
+    super(1);
+    this.name = 'Forest L1';
+    this.continent = 'forest';
+    this.mapSceneClass = ForestMapScene;
+    // 6 顆果實：刻意打散順序
+    // 顏色：red/blue, 形狀：round/square
+    this.fruits = [
+      { id: 0, color:'red',  shape:'round',  placed: null, x: 0, y: 0, baseX: 0, baseY: 0 },
+      { id: 1, color:'blue', shape:'square', placed: null, x: 0, y: 0, baseX: 0, baseY: 0 },
+      { id: 2, color:'red',  shape:'square', placed: null, x: 0, y: 0, baseX: 0, baseY: 0 },
+      { id: 3, color:'blue', shape:'round',  placed: null, x: 0, y: 0, baseX: 0, baseY: 0 },
+      { id: 4, color:'red',  shape:'round',  placed: null, x: 0, y: 0, baseX: 0, baseY: 0 },
+      { id: 5, color:'blue', shape:'square', placed: null, x: 0, y: 0, baseX: 0, baseY: 0 },
+    ];
+    // 4 個籃子（順序刻意打散，避免直覺從左到右）
+    this.baskets = [
+      { id: 0, color:'blue', shape:'square', x: 0, y: 0 },
+      { id: 1, color:'red',  shape:'round',  x: 0, y: 0 },
+      { id: 2, color:'blue', shape:'round',  x: 0, y: 0 },
+      { id: 3, color:'red',  shape:'square', x: 0, y: 0 },
+    ];
+    this.selectedFruit = null;
+    this.placedCount = 0;
+  }
+  layout() {
+    this.baseLayout();
+    const W = Game.width, H = Game.height;
+    // 果實放在上半部（兩排）
+    const fruitY1 = H*0.25, fruitY2 = H*0.40;
+    const fruitSpacing = Math.min(W*0.12, 90);
+    const fruitStartX = W*0.5 - fruitSpacing*1;
+    this.fruits.forEach((f, i) => {
+      const row = Math.floor(i / 3);
+      const col = i % 3;
+      f.baseX = fruitStartX + col * fruitSpacing;
+      f.baseY = row === 0 ? fruitY1 : fruitY2;
+      if (f.placed === null) { f.x = f.baseX; f.y = f.baseY; }
+    });
+    // 籃子放在下半部（一排）
+    const basketY = H*0.7;
+    const basketSpacing = Math.min(W*0.18, 130);
+    const basketStartX = W*0.5 - basketSpacing*1.5;
+    this.baskets.forEach((b, i) => {
+      b.x = basketStartX + i * basketSpacing;
+      b.y = basketY;
+    });
+  }
+  onResize() { this.layout(); if (this.cat) { this.cat.x = this.catStartX; this.cat.y = this.groundY; } }
+  onTap(x, y) {
+    if (this.baseTap(x, y) !== null) return;
+
+    // 選果實
+    if (!this.selectedFruit) {
+      for (const f of this.fruits) {
+        if (f.placed !== null) continue;
+        const dx = x - f.x, dy = y - f.y;
+        if (dx*dx + dy*dy < 28*28) {
+          this.selectedFruit = f;
+          return;
+        }
+      }
+    } else {
+      // 點籃子放入
+      for (const b of this.baskets) {
+        const dx = x - b.x, dy = y - b.y;
+        if (dx*dx + dy*dy < 50*50) {
+          // 檢查條件
+          const f = this.selectedFruit;
+          if (f.color === b.color && f.shape === b.shape) {
+            f.placed = b.id;
+            this.placedCount++;
+            this.showFeedback(`✨ 對了！${f.color === 'red' ? '紅' : '藍'}+${f.shape === 'round' ? '圓' : '方'} 放對籃子`, '#81c784');
+            this.selectedFruit = null;
+            if (this.placedCount >= 6) {
+              setTimeout(() => this.startWalk(), 800);
+            }
+          } else {
+            this.showFeedback('❌ 籃子條件不對！再仔細看看', '#ff7043');
+            this.selectedFruit = null;
+          }
+          return;
+        }
+      }
+      // 點空白：取消選擇
+      this.selectedFruit = null;
+    }
+  }
+  update(dt) {
+    this.baseUpdate(dt);
+    // 已放入籃子的果實移動到籃子位置
+    for (const f of this.fruits) {
+      if (f.placed !== null) {
+        const b = this.baskets[f.placed];
+        f.x += (b.x - f.x) * dt * 8;
+        f.y += (b.y - 18 - f.y) * dt * 8;
+      }
+    }
+  }
+  drawBackground(ctx) {
+    const W = Game.width, H = Game.height;
+    const sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, '#1b5e20'); sky.addColorStop(0.4, '#2e7d32');
+    sky.addColorStop(0.8, '#388e3c'); sky.addColorStop(1, '#1b5e20');
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+    // 樹木
+    ctx.fillStyle = '#0d3a10';
+    for (let i = 0; i < 6; i++) {
+      const tx = W * (i+0.5) / 6 + Math.sin(i*1.7) * 30;
+      const th = 80;
+      ctx.fillRect(tx-6, this.groundY - 30, 12, 30);
+      ctx.beginPath(); ctx.arc(tx, this.groundY - 60, 35, 0, Math.PI*2); ctx.fill();
+    }
+    const gd = ctx.createLinearGradient(0, this.groundY, 0, H);
+    gd.addColorStop(0, '#2e5b1f'); gd.addColorStop(1, '#1a3a10');
+    ctx.fillStyle = gd;
+    ctx.fillRect(0, this.groundY, W, H - this.groundY);
+  }
+  drawForeground(ctx) {
+    for (const p of this.successParticles) {
+      const a = 1 - (p.life / p.maxLife);
+      ctx.fillStyle = p.color; ctx.globalAlpha = a;
+      ctx.fillRect(p.x, p.y, p.size*2, p.size*2);
+    }
+    ctx.globalAlpha = 1;
+  }
+  drawFruit(ctx, f, scale = 1) {
+    const fillColor = f.color === 'red' ? '#e53935' : '#1e88e5';
+    const darkColor = f.color === 'red' ? '#7f0000' : '#0d47a1';
+    const r = 22 * scale;
+    if (f.shape === 'round') {
+      // 圓形果實
+      const grad = ctx.createRadialGradient(f.x-r*0.3, f.y-r*0.3, 0, f.x, f.y, r);
+      grad.addColorStop(0, f.color === 'red' ? '#ff8a80' : '#90caf9');
+      grad.addColorStop(1, fillColor);
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(f.x, f.y, r, 0, Math.PI*2); ctx.fill();
+      // 葉子
+      ctx.fillStyle = '#4caf50';
+      ctx.beginPath();
+      ctx.ellipse(f.x+r*0.3, f.y-r*1.1, 5, 8, -0.5, 0, Math.PI*2); ctx.fill();
+      // 高光
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.beginPath(); ctx.arc(f.x-r*0.3, f.y-r*0.4, r*0.3, 0, Math.PI*2); ctx.fill();
+    } else {
+      // 方形果實
+      const grad = ctx.createLinearGradient(f.x-r, f.y-r, f.x+r, f.y+r);
+      grad.addColorStop(0, f.color === 'red' ? '#ff8a80' : '#90caf9');
+      grad.addColorStop(1, fillColor);
+      ctx.fillStyle = grad;
+      ctx.fillRect(f.x-r, f.y-r, r*2, r*2);
+      ctx.strokeStyle = darkColor;
+      ctx.lineWidth = 2;
+      ctx.strokeRect(f.x-r, f.y-r, r*2, r*2);
+      // 葉子（在上方）
+      ctx.fillStyle = '#4caf50';
+      ctx.beginPath();
+      ctx.ellipse(f.x+r*0.3, f.y-r*1.2, 5, 8, -0.5, 0, Math.PI*2); ctx.fill();
+      // 高光
+      ctx.fillStyle = 'rgba(255,255,255,0.4)';
+      ctx.fillRect(f.x-r+3, f.y-r+3, r*0.6, 4);
+    }
+  }
+  drawBasket(ctx, b) {
+    // 籃子身體
+    ctx.fillStyle = '#8b4513';
+    ctx.beginPath();
+    ctx.moveTo(b.x-45, b.y-15);
+    ctx.lineTo(b.x+45, b.y-15);
+    ctx.lineTo(b.x+38, b.y+25);
+    ctx.lineTo(b.x-38, b.y+25);
+    ctx.closePath(); ctx.fill();
+    // 籃子紋路
+    ctx.strokeStyle = '#5d4037';
+    ctx.lineWidth = 1.5;
+    for (let i = 0; i < 5; i++) {
+      const yOffset = b.y-12 + i*8;
+      ctx.beginPath();
+      ctx.moveTo(b.x-44+i*2, yOffset);
+      ctx.lineTo(b.x+44-i*2, yOffset);
+      ctx.stroke();
+    }
+    // 籃子把手
+    ctx.strokeStyle = '#5d4037';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(b.x, b.y-15, 30, Math.PI, 0, true);
+    ctx.stroke();
+
+    // 條件圖示（在籃子上方）— 顏色用文字、形狀用「不上色」純框
+    const iconY = b.y - 50;
+    // 1️⃣ 顏色文字
+    const colorText = b.color === 'red' ? '紅' : '藍';
+    const colorTextFill = b.color === 'red' ? '#ff5252' : '#42a5f5';
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(b.x-30, iconY-12, 22, 22);
+    ctx.fillStyle = colorTextFill;
+    ctx.font = 'bold 16px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(colorText, b.x-19, iconY);
+
+    // + 號
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 14px -apple-system';
+    ctx.fillText('+', b.x-2, iconY);
+
+    // 2️⃣ 形狀圖（純線條，不上色）
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2.5;
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    if (b.shape === 'round') {
+      ctx.beginPath();
+      ctx.arc(b.x+18, iconY, 11, 0, Math.PI*2);
+      ctx.fill(); ctx.stroke();
+    } else {
+      ctx.fillRect(b.x+8, iconY-11, 22, 22);
+      ctx.strokeRect(b.x+8, iconY-11, 22, 22);
+    }
+    ctx.textBaseline = 'alphabetic';
+
+    // 籃子號碼
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 11px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${b.id+1}`, b.x, b.y+12);
+  }
+  draw(ctx) {
+    const W = Game.width, H = Game.height;
+    this.drawBackground(ctx);
+
+    // 籃子
+    for (const b of this.baskets) this.drawBasket(ctx, b);
+
+    // 果實（已放好的最後畫，疊在籃子上）
+    const unplaced = this.fruits.filter(f => f.placed === null);
+    const placed = this.fruits.filter(f => f.placed !== null);
+    for (const f of unplaced) {
+      // 選中的會放大
+      const isSelected = this.selectedFruit && this.selectedFruit.id === f.id;
+      const scale = isSelected ? 1.2 + Math.sin(this.time*5)*0.05 : 1;
+      // 選中的有光暈
+      if (isSelected) {
+        ctx.fillStyle = `rgba(255,235,59,${0.3+Math.sin(this.time*4)*0.2})`;
+        ctx.beginPath(); ctx.arc(f.x, f.y, 36, 0, Math.PI*2); ctx.fill();
+      }
+      this.drawFruit(ctx, f, scale);
+    }
+    for (const f of placed) this.drawFruit(ctx, f, 0.7);
+
+    if (this.cat) this.cat.draw(ctx);
+    this.drawForeground(ctx);
+
+    this.drawHeader(ctx, '🌿 森林大陸 — 第 1 關 果實分類',
+      this.selectedFruit ? '👆 點對的籃子放進去' : `點果實選擇 (${this.placedCount}/6)`);
+    this.drawBackBtn(ctx);
+    this.drawFeedback(ctx);
+
+    if (this.showHintCard) {
+      this.drawHintCard(ctx, '💡 多重條件分類', [
+        '看果實要符合「兩個條件」：',
+        '🎨 顏色（紅 / 藍）',
+        '🔷 形狀（圓 / 方）',
+        '',
+        '紅+圓 不等於 紅+方！',
+        '兩個條件都要對才放對籃子',
+        '',
+        '✨ 這就是程式設計的「if A 而且 B」',
+        '是寫程式最重要的基本功！',
+      ]);
+    }
+    if (this.showWinCard) this.drawWinCard(ctx, '果實全部分對了！');
+    this.drawEnterFade(ctx);
+  }
+}
+
+/* ============================================================
+   ❄️ 冰之大陸地圖
+   ============================================================ */
+class IceMapScene {
+  constructor() {
+    this.name = 'IceMap';
+    this.time = 0;
+    this.snowflakes = [];
+    this.cat = null;
+    this.enterAlpha = 1;
+    this.enterTween = new Tween(1, 0, 0.6, Easing.easeOutCubic);
+    this.backBtn = { x: 50, y: 30, r: 22 };
+    this.levels = [];
+  }
+  enter() {
+    this.layout();
+    this.cat = new PixelCat(Game.width * 0.5, Game.height * 0.85);
+    this.cat.scale = 2;
+    for (let i = 0; i < 60; i++) {
+      this.snowflakes.push({
+        x: Math.random()*Game.width, y: Math.random()*Game.height,
+        vy: 30+Math.random()*40, vx: -10+Math.random()*20,
+        size: 1+Math.random()*3,
+        sway: Math.random()*Math.PI*2,
+      });
+    }
+  }
+  onResize() { this.layout(); }
+  layout() {
+    const W = Game.width, H = Game.height;
+    const lv = Game.progress.iceLevel || 0;
+    this.levels = [
+      { num: 1, name: '雪地偵探', x: W*0.25, y: H*0.55, cleared: lv>=1, unlocked: true,    r: 36 },
+      { num: 2, name: '?', x: W*0.42, y: H*0.42, cleared: lv>=2, unlocked: lv>=1, r: 36 },
+      { num: 3, name: '?', x: W*0.58, y: H*0.55, cleared: lv>=3, unlocked: lv>=2, r: 36 },
+      { num: 4, name: '?', x: W*0.75, y: H*0.42, cleared: lv>=4, unlocked: lv>=3, r: 36 },
+    ];
+  }
+  onTap(x, y) {
+    const bx = x - this.backBtn.x, by = y - this.backBtn.y;
+    if (bx*bx + by*by < this.backBtn.r * this.backBtn.r) {
+      Game.changeScene(new WorldMapScene()); return;
+    }
+    for (const lv of this.levels) {
+      if (!lv.unlocked) continue;
+      const dx = x - lv.x, dy = y - lv.y;
+      if (dx*dx + dy*dy < lv.r*lv.r) {
+        if (lv.num === 1) Game.changeScene(new IceLevel1Scene());
+        return;
+      }
+    }
+  }
+  update(dt) {
+    this.time += dt;
+    this.enterAlpha = this.enterTween.update(dt);
+    if (this.cat) this.cat.update(dt);
+    for (const s of this.snowflakes) {
+      s.y += s.vy * dt;
+      s.x += Math.sin(this.time*2 + s.sway) * 15 * dt;
+      if (s.y > Game.height + 5) { s.y = -5; s.x = Math.random()*Game.width; }
+    }
+  }
+  draw(ctx) {
+    const W = Game.width, H = Game.height;
+    // 冰雪天空
+    const sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, '#1a3a5a'); sky.addColorStop(0.4, '#5a8aaa');
+    sky.addColorStop(0.8, '#bbdefb'); sky.addColorStop(1, '#e3f2fd');
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+
+    // 極光（背景）
+    const auroraY = H * 0.2;
+    for (let i = 0; i < 3; i++) {
+      const grad = ctx.createLinearGradient(0, auroraY-30+i*8, 0, auroraY+30+i*8);
+      const colors = [
+        ['rgba(76,175,80,0)', 'rgba(76,175,80,0.3)', 'rgba(76,175,80,0)'],
+        ['rgba(156,39,176,0)', 'rgba(156,39,176,0.2)', 'rgba(156,39,176,0)'],
+        ['rgba(33,150,243,0)', 'rgba(33,150,243,0.2)', 'rgba(33,150,243,0)'],
+      ][i];
+      grad.addColorStop(0, colors[0]); grad.addColorStop(0.5, colors[1]); grad.addColorStop(1, colors[2]);
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.moveTo(0, auroraY + Math.sin(this.time*0.5+i)*5);
+      for (let x = 0; x <= W; x += 30) {
+        ctx.lineTo(x, auroraY + Math.sin(this.time*0.5 + x*0.01 + i*2)*15 + i*8);
+      }
+      ctx.lineTo(W, auroraY + 60); ctx.lineTo(0, auroraY + 60);
+      ctx.closePath(); ctx.fill();
+    }
+
+    // 遠方雪山剪影
+    ctx.fillStyle = '#90a4ae';
+    ctx.beginPath();
+    ctx.moveTo(0, H*0.6);
+    ctx.lineTo(W*0.15, H*0.4); ctx.lineTo(W*0.25, H*0.5);
+    ctx.lineTo(W*0.4, H*0.35); ctx.lineTo(W*0.55, H*0.45);
+    ctx.lineTo(W*0.7, H*0.38); ctx.lineTo(W*0.85, H*0.5);
+    ctx.lineTo(W, H*0.42); ctx.lineTo(W, H*0.7); ctx.lineTo(0, H*0.7);
+    ctx.closePath(); ctx.fill();
+    // 雪山頂的雪
+    ctx.fillStyle = '#fff';
+    [[W*0.15, H*0.4], [W*0.4, H*0.35], [W*0.7, H*0.38]].forEach(([px, py]) => {
+      ctx.beginPath();
+      ctx.moveTo(px-15, py+5);
+      ctx.lineTo(px, py-2);
+      ctx.lineTo(px+15, py+5);
+      ctx.closePath(); ctx.fill();
+    });
+
+    // 雪地地面
+    const gd = ctx.createLinearGradient(0, H*0.7, 0, H);
+    gd.addColorStop(0, '#e3f2fd'); gd.addColorStop(1, '#90caf9');
+    ctx.fillStyle = gd;
+    ctx.fillRect(0, H*0.7, W, H*0.3);
+
+    // 路徑
+    ctx.strokeStyle = 'rgba(100,150,200,0.5)';
+    ctx.lineWidth = 3;
+    ctx.setLineDash([8, 8]);
+    ctx.beginPath();
+    ctx.moveTo(this.cat.x, this.cat.y - 30);
+    for (let i = 0; i < this.levels.length; i++) {
+      const lv = this.levels[i];
+      if (i === 0) ctx.lineTo(lv.x, lv.y);
+      else {
+        const prev = this.levels[i-1];
+        const mx = (prev.x + lv.x) / 2;
+        const my = (prev.y + lv.y) / 2 + (i % 2 === 0 ? 30 : -30);
+        ctx.quadraticCurveTo(mx, my, lv.x, lv.y);
+      }
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 關卡圖示
+    for (const lv of this.levels) {
+      const bob = Math.sin(this.time*2 + lv.num) * 4;
+      const cy = lv.y + bob;
+      if (lv.unlocked && !lv.cleared) {
+        ctx.fillStyle = `rgba(150,220,255,${0.3+Math.sin(this.time*3+lv.num)*0.2})`;
+        ctx.beginPath(); ctx.arc(lv.x, cy, lv.r+18, 0, Math.PI*2); ctx.fill();
+      }
+      const grad = ctx.createRadialGradient(lv.x, cy, 0, lv.x, cy, lv.r);
+      if (lv.cleared) { grad.addColorStop(0, '#ffd700'); grad.addColorStop(1, '#b8860b'); }
+      else if (lv.unlocked) { grad.addColorStop(0, '#90caf9'); grad.addColorStop(1, '#1976d2'); }
+      else { grad.addColorStop(0, '#3a4a5a'); grad.addColorStop(1, '#1a2a3a'); }
+      ctx.fillStyle = grad;
+      ctx.beginPath(); ctx.arc(lv.x, cy, lv.r, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = lv.cleared ? '#fff8d0' : (lv.unlocked ? '#bbdefb' : '#5a6a7a');
+      ctx.lineWidth = 3; ctx.stroke();
+      ctx.fillStyle = lv.unlocked ? '#fff' : 'rgba(255,255,255,0.3)';
+      ctx.font = 'bold 28px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(lv.unlocked ? `${lv.num}` : '🔒', lv.x, cy);
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = lv.unlocked ? 'rgba(255,255,255,0.85)' : 'rgba(255,255,255,0.3)';
+      ctx.font = '13px -apple-system, "PingFang TC"';
+      ctx.fillText(lv.name, lv.x, cy + lv.r + 22);
+      if (lv.cleared) {
+        ctx.fillStyle = '#4caf50';
+        ctx.beginPath(); ctx.arc(lv.x+lv.r-8, cy-lv.r+8, 11, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 14px -apple-system'; ctx.textBaseline = 'middle';
+        ctx.fillText('✓', lv.x+lv.r-8, cy-lv.r+9);
+        ctx.textBaseline = 'alphabetic';
+      }
+    }
+
+    if (this.cat) this.cat.draw(ctx);
+
+    // 雪花
+    for (const s of this.snowflakes) {
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.beginPath(); ctx.arc(s.x, s.y, s.size, 0, Math.PI*2); ctx.fill();
+    }
+
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(W/2 - 110, 16, 220, 36);
+    ctx.fillStyle = '#bbdefb';
+    ctx.font = 'bold 18px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText('❄️ 冰之大陸 — 選擇關卡', W/2, 40);
+    const lv = Game.progress.iceLevel || 0;
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.font = '13px -apple-system, "PingFang TC"';
+    ctx.fillText(`進度：${lv} / 4 關（V1 僅開放第 1 關）`, W/2, 70);
+
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.beginPath();
+    ctx.arc(this.backBtn.x, this.backBtn.y, this.backBtn.r, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 22px -apple-system';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('←', this.backBtn.x, this.backBtn.y);
+    ctx.textBaseline = 'alphabetic';
+
+    if (this.enterAlpha > 0) {
+      ctx.fillStyle = `rgba(0,0,0,${this.enterAlpha})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+  }
+}
+
+/* ============================================================
+   ❄️ 冰之大陸第 1 關：雪地偵探（解謎推理）
+   說明：寶石被偷！3 個嫌疑犯，3 個線索，要綜合推理找出小偷
+   特徵表：
+     🦊 小狐狸：中 / 橘 / 中
+     🐧 小企鵝：小 / 黑白 / 矮
+     🐰 大白兔：大 / 白 / 高（正解！3 個線索都符合）
+   ============================================================ */
+class IceLevel1Scene extends FireLevelBase {
+  constructor() {
+    super(1);
+    this.name = 'Ice L1';
+    this.continent = 'ice';
+    this.mapSceneClass = IceMapScene;
+    this.snowflakes = [];
+    // 3 個嫌疑犯（順序刻意把正解放中間，避免直覺按第一個）
+    this.suspects = [
+      { id: 'fox',     name:'小狐狸', size:'中', color:'橘',   height:'中', x:0, y:0 },
+      { id: 'rabbit',  name:'大白兔', size:'大', color:'白',   height:'高', x:0, y:0, isThief: true },
+      { id: 'penguin', name:'小企鵝', size:'小', color:'黑白', height:'矮', x:0, y:0 },
+    ];
+    // 3 個線索（一開始隱藏，要點才顯示）
+    this.clues = [
+      { id: 0, icon:'🐾', label:'腳印',    text:'地上腳印很大', revealed: false, x:0, y:0 },
+      { id: 1, icon:'🧶', label:'毛髮',    text:'地上有白色毛髮', revealed: false, x:0, y:0 },
+      { id: 2, icon:'📏', label:'高度',    text:'寶石箱被打破在很高的地方', revealed: false, x:0, y:0 },
+    ];
+    this.solved = false;
+    this.wrongChoice = null;     // 選錯的嫌疑犯（顯示問號）
+    this.wrongTimer = 0;
+  }
+  layout() {
+    this.baseLayout();
+    const W = Game.width, H = Game.height;
+    // 線索卡（畫面下方一排）
+    const clueY = H - 70;
+    const clueSpacing = Math.min(W*0.22, 160);
+    const clueStartX = W*0.5 - clueSpacing*1;
+    this.clues.forEach((c, i) => {
+      c.x = clueStartX + i * clueSpacing;
+      c.y = clueY;
+    });
+    // 嫌疑犯（畫面中間排）
+    const susY = H*0.45;
+    const susSpacing = Math.min(W*0.20, 150);
+    const susStartX = W*0.5 - susSpacing*1;
+    this.suspects.forEach((s, i) => {
+      s.x = susStartX + i * susSpacing;
+      s.y = susY;
+    });
+  }
+  onResize() { this.layout(); if (this.cat) { this.cat.x = this.catStartX; this.cat.y = this.groundY; } }
+  onEnter() {
+    for (let i = 0; i < 50; i++) {
+      this.snowflakes.push({
+        x: Math.random()*Game.width, y: Math.random()*Game.height,
+        vy: 30+Math.random()*40, vx: -10+Math.random()*20,
+        size: 1+Math.random()*3, sway: Math.random()*Math.PI*2,
+      });
+    }
+  }
+  onTap(x, y) {
+    if (this.baseTap(x, y) !== null) return;
+    if (this.solved) return;
+
+    // 點線索卡
+    for (const c of this.clues) {
+      const dx = x - c.x, dy = y - c.y;
+      if (dx*dx + dy*dy < 50*50) {
+        c.revealed = true;
+        return;
+      }
+    }
+    // 點嫌疑犯
+    for (const s of this.suspects) {
+      const dx = x - s.x, dy = y - s.y - 10;
+      if (dx*dx + dy*dy < 60*60) {
+        // 確認所有線索都看過了
+        const allRevealed = this.clues.every(c => c.revealed);
+        if (!allRevealed) {
+          this.showFeedback('🔍 還有線索沒看，先點開所有線索卡', '#ffb74d');
+          return;
+        }
+        if (s.isThief) {
+          this.solved = true;
+          this.showFeedback('🎉 抓到了！就是大白兔！', '#ffd700');
+          setTimeout(() => this.startWalk(), 1500);
+        } else {
+          this.wrongChoice = s.id;
+          this.wrongTimer = 1.5;
+          this.showFeedback('❌ 線索不符！再仔細想想', '#ff7043');
+        }
+        return;
+      }
+    }
+  }
+  update(dt) {
+    this.baseUpdate(dt);
+    if (this.wrongTimer > 0) {
+      this.wrongTimer -= dt;
+      if (this.wrongTimer <= 0) this.wrongChoice = null;
+    }
+    for (const s of this.snowflakes) {
+      s.y += s.vy * dt;
+      s.x += Math.sin(this.time*2 + s.sway) * 15 * dt;
+      if (s.y > Game.height + 5) { s.y = -5; s.x = Math.random()*Game.width; }
+    }
+  }
+  drawBackground(ctx) {
+    const W = Game.width, H = Game.height;
+    const sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, '#1a3a5a'); sky.addColorStop(0.4, '#5a8aaa');
+    sky.addColorStop(0.8, '#bbdefb'); sky.addColorStop(1, '#e3f2fd');
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+    // 極光
+    const auroraY = H * 0.15;
+    for (let i = 0; i < 3; i++) {
+      const grad = ctx.createLinearGradient(0, auroraY-20+i*6, 0, auroraY+20+i*6);
+      const colors = [
+        ['rgba(76,175,80,0)', 'rgba(76,175,80,0.25)', 'rgba(76,175,80,0)'],
+        ['rgba(156,39,176,0)', 'rgba(156,39,176,0.18)', 'rgba(156,39,176,0)'],
+        ['rgba(33,150,243,0)', 'rgba(33,150,243,0.18)', 'rgba(33,150,243,0)'],
+      ][i];
+      grad.addColorStop(0, colors[0]); grad.addColorStop(0.5, colors[1]); grad.addColorStop(1, colors[2]);
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.moveTo(0, auroraY + Math.sin(this.time*0.5+i)*5);
+      for (let x = 0; x <= W; x += 30) {
+        ctx.lineTo(x, auroraY + Math.sin(this.time*0.5 + x*0.01 + i*2)*12 + i*6);
+      }
+      ctx.lineTo(W, auroraY + 50); ctx.lineTo(0, auroraY + 50);
+      ctx.closePath(); ctx.fill();
+    }
+    // 雪地
+    const gd = ctx.createLinearGradient(0, this.groundY, 0, H);
+    gd.addColorStop(0, '#e3f2fd'); gd.addColorStop(1, '#90caf9');
+    ctx.fillStyle = gd;
+    ctx.fillRect(0, this.groundY, W, H - this.groundY);
+  }
+  drawForeground(ctx) {
+    // 雪花
+    for (const s of this.snowflakes) {
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.beginPath(); ctx.arc(s.x, s.y, s.size, 0, Math.PI*2); ctx.fill();
+    }
+    // 慶祝
+    for (const p of this.successParticles) {
+      const a = 1 - (p.life / p.maxLife);
+      ctx.fillStyle = p.color; ctx.globalAlpha = a;
+      ctx.fillRect(p.x, p.y, p.size*2, p.size*2);
+    }
+    ctx.globalAlpha = 1;
+  }
+  drawSuspect(ctx, s) {
+    const cx = s.x, cy = s.y;
+    const isWrong = this.wrongChoice === s.id;
+    const wrongShake = isWrong ? Math.sin(this.time*30) * 3 : 0;
+
+    // 影子
+    ctx.fillStyle = 'rgba(0,0,0,0.2)';
+    ctx.beginPath();
+    ctx.ellipse(cx + wrongShake, cy + 50, 30, 6, 0, 0, Math.PI*2); ctx.fill();
+
+    if (s.id === 'fox') {
+      // 小狐狸（中等大小、橘色）
+      const baseY = cy + 50;
+      ctx.fillStyle = '#ff7043';
+      // 身體
+      ctx.beginPath(); ctx.ellipse(cx + wrongShake, baseY - 18, 20, 24, 0, 0, Math.PI*2); ctx.fill();
+      // 頭
+      ctx.beginPath(); ctx.arc(cx + wrongShake, baseY - 42, 16, 0, Math.PI*2); ctx.fill();
+      // 耳朵
+      ctx.beginPath();
+      ctx.moveTo(cx-12+wrongShake, baseY-50); ctx.lineTo(cx-8+wrongShake, baseY-62); ctx.lineTo(cx-3+wrongShake, baseY-50);
+      ctx.closePath(); ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(cx+12+wrongShake, baseY-50); ctx.lineTo(cx+8+wrongShake, baseY-62); ctx.lineTo(cx+3+wrongShake, baseY-50);
+      ctx.closePath(); ctx.fill();
+      // 白肚子
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.ellipse(cx+wrongShake, baseY-12, 8, 14, 0, 0, Math.PI*2); ctx.fill();
+      // 尾巴
+      ctx.fillStyle = '#ff7043';
+      ctx.beginPath(); ctx.ellipse(cx+22+wrongShake, baseY-15, 8, 14, 0.5, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(cx+27+wrongShake, baseY-10, 5, 0, Math.PI*2); ctx.fill();
+      // 眼睛
+      ctx.fillStyle = '#000';
+      ctx.beginPath(); ctx.arc(cx-5+wrongShake, baseY-44, 2, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx+5+wrongShake, baseY-44, 2, 0, Math.PI*2); ctx.fill();
+      // 鼻子
+      ctx.beginPath(); ctx.arc(cx+wrongShake, baseY-37, 1.5, 0, Math.PI*2); ctx.fill();
+    } else if (s.id === 'rabbit') {
+      // 大白兔（大、白色、高）
+      const baseY = cy + 55;
+      const jumpOffset = Math.abs(Math.sin(this.time*1.5)) * 6;
+      // 身體（大）
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.ellipse(cx + wrongShake, baseY - 30 - jumpOffset, 26, 32, 0, 0, Math.PI*2); ctx.fill();
+      // 頭
+      ctx.beginPath(); ctx.arc(cx + wrongShake, baseY - 60 - jumpOffset, 20, 0, Math.PI*2); ctx.fill();
+      // 大耳朵（高！）
+      ctx.beginPath(); ctx.ellipse(cx-10+wrongShake, baseY-78-jumpOffset, 6, 18, 0, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx+10+wrongShake, baseY-78-jumpOffset, 6, 18, 0, 0, Math.PI*2); ctx.fill();
+      // 耳朵內粉
+      ctx.fillStyle = '#ffcdd2';
+      ctx.beginPath(); ctx.ellipse(cx-10+wrongShake, baseY-78-jumpOffset, 3, 12, 0, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx+10+wrongShake, baseY-78-jumpOffset, 3, 12, 0, 0, Math.PI*2); ctx.fill();
+      // 眼睛
+      ctx.fillStyle = '#000';
+      ctx.beginPath(); ctx.arc(cx-7+wrongShake, baseY-62-jumpOffset, 2.5, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx+7+wrongShake, baseY-62-jumpOffset, 2.5, 0, Math.PI*2); ctx.fill();
+      // 鼻子
+      ctx.fillStyle = '#ff8fa0';
+      ctx.beginPath(); ctx.arc(cx+wrongShake, baseY-55-jumpOffset, 2, 0, Math.PI*2); ctx.fill();
+      // 邊框（讓白色可見）
+      ctx.strokeStyle = '#bbdefb';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.ellipse(cx+wrongShake, baseY-30-jumpOffset, 26, 32, 0, 0, Math.PI*2); ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx+wrongShake, baseY-60-jumpOffset, 20, 0, Math.PI*2); ctx.stroke();
+    } else if (s.id === 'penguin') {
+      // 小企鵝（小、黑白、矮）
+      const baseY = cy + 50;
+      // 身體（小）
+      ctx.fillStyle = '#1a1a1a';
+      ctx.beginPath(); ctx.ellipse(cx + wrongShake, baseY - 12, 14, 20, 0, 0, Math.PI*2); ctx.fill();
+      // 白肚子
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.ellipse(cx + wrongShake, baseY - 10, 8, 15, 0, 0, Math.PI*2); ctx.fill();
+      // 頭
+      ctx.fillStyle = '#1a1a1a';
+      ctx.beginPath(); ctx.arc(cx + wrongShake, baseY - 32, 12, 0, Math.PI*2); ctx.fill();
+      // 白臉
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(cx + wrongShake, baseY - 30, 8, 0, Math.PI*2); ctx.fill();
+      // 眼睛
+      ctx.fillStyle = '#000';
+      ctx.beginPath(); ctx.arc(cx-3+wrongShake, baseY-32, 1.5, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(cx+3+wrongShake, baseY-32, 1.5, 0, Math.PI*2); ctx.fill();
+      // 嘴
+      ctx.fillStyle = '#ffa726';
+      ctx.beginPath();
+      ctx.moveTo(cx-2+wrongShake, baseY-28); ctx.lineTo(cx+wrongShake, baseY-25); ctx.lineTo(cx+2+wrongShake, baseY-28);
+      ctx.closePath(); ctx.fill();
+      // 翅膀
+      ctx.fillStyle = '#1a1a1a';
+      ctx.beginPath(); ctx.ellipse(cx-12+wrongShake, baseY-12, 4, 10, 0.3, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(cx+12+wrongShake, baseY-12, 4, 10, -0.3, 0, Math.PI*2); ctx.fill();
+      // 腳
+      ctx.fillStyle = '#ffa726';
+      ctx.fillRect(cx-6+wrongShake, baseY+5, 4, 4);
+      ctx.fillRect(cx+2+wrongShake, baseY+5, 4, 4);
+    }
+
+    // 名牌
+    ctx.fillStyle = isWrong ? '#ff5252' : 'rgba(0,0,0,0.5)';
+    ctx.fillRect(cx-30, cy+58, 60, 18);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 12px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(s.name, cx, cy+67);
+    ctx.textBaseline = 'alphabetic';
+
+    // 答錯時的問號
+    if (isWrong) {
+      const a = this.wrongTimer / 1.5;
+      ctx.fillStyle = `rgba(255,82,82,${a})`;
+      ctx.font = 'bold 36px -apple-system';
+      ctx.fillText('❓', cx, cy - 70);
+    }
+  }
+  drawClueCard(ctx, c) {
+    const cw = 140, ch = 90;
+    const cx = c.x - cw/2, cy = c.y - ch/2;
+    if (c.revealed) {
+      ctx.fillStyle = 'rgba(255,253,220,0.95)';
+      ctx.strokeStyle = '#ffd700';
+    } else {
+      ctx.fillStyle = 'rgba(60,60,90,0.85)';
+      ctx.strokeStyle = '#90caf9';
+    }
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(cx, cy, cw, ch, 10);
+    else ctx.rect(cx, cy, cw, ch);
+    ctx.fill(); ctx.stroke();
+
+    if (c.revealed) {
+      // 圖示
+      ctx.font = '28px -apple-system';
+      ctx.textAlign = 'center';
+      ctx.fillText(c.icon, c.x, c.y - 14);
+      // 標題
+      ctx.fillStyle = '#5a3a10';
+      ctx.font = 'bold 12px -apple-system, "PingFang TC"';
+      ctx.fillText(c.label, c.x, c.y + 8);
+      // 內容
+      ctx.fillStyle = '#1a1a1a';
+      ctx.font = 'bold 13px -apple-system, "PingFang TC"';
+      ctx.fillText(c.text, c.x, c.y + 28);
+    } else {
+      // 未開啟
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 32px -apple-system';
+      ctx.textAlign = 'center';
+      ctx.fillText('🔍', c.x, c.y + 6);
+      ctx.font = '11px -apple-system, "PingFang TC"';
+      ctx.fillText('點開查看', c.x, c.y + 28);
+    }
+  }
+  draw(ctx) {
+    const W = Game.width, H = Game.height;
+    this.drawBackground(ctx);
+
+    // 寶石箱（被打破，左上）
+    const boxX = W*0.15, boxY = this.groundY - 20;
+    ctx.fillStyle = '#5d4037';
+    ctx.fillRect(boxX-25, boxY-20, 50, 30);
+    // 破洞
+    ctx.fillStyle = '#1a0a05';
+    ctx.beginPath();
+    ctx.moveTo(boxX-15, boxY-22);
+    ctx.lineTo(boxX, boxY-30);
+    ctx.lineTo(boxX+15, boxY-20);
+    ctx.lineTo(boxX+10, boxY-10);
+    ctx.lineTo(boxX-10, boxY-10);
+    ctx.closePath(); ctx.fill();
+    // 殘留珠寶亮點
+    ctx.fillStyle = `rgba(76,175,80,${0.5+Math.sin(this.time*4)*0.3})`;
+    ctx.beginPath(); ctx.arc(boxX-3, boxY-15, 2, 0, Math.PI*2); ctx.fill();
+    // 標籤
+    ctx.fillStyle = '#1a1a1a';
+    ctx.font = 'bold 12px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'center';
+    ctx.fillText('💎 寶石箱（被打破）', boxX, boxY + 25);
+
+    // 嫌疑犯
+    for (const s of this.suspects) this.drawSuspect(ctx, s);
+
+    // 線索卡（在道具列上方）
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.fillRect(0, H-110, W, 110);
+    ctx.fillStyle = '#bbdefb';
+    ctx.font = 'bold 12px -apple-system, "PingFang TC"';
+    ctx.textAlign = 'left';
+    ctx.fillText('🔍 線索卡（點開後點嫌疑犯）', 20, H-95);
+    for (const c of this.clues) this.drawClueCard(ctx, c);
+
+    if (this.cat) this.cat.draw(ctx);
+    this.drawForeground(ctx);
+
+    const allRevealed = this.clues.every(c => c.revealed);
+    this.drawHeader(ctx, '❄️ 冰之大陸 — 第 1 關 雪地偵探',
+      allRevealed ? '👆 點你覺得是小偷的嫌疑犯' : `先看完所有線索 (${this.clues.filter(c=>c.revealed).length}/3)`);
+    this.drawBackBtn(ctx);
+    this.drawFeedback(ctx);
+
+    if (this.showHintCard) {
+      this.drawHintCard(ctx, '💡 解謎推理', [
+        '看到單一線索不夠！',
+        '要把所有線索「**綜合**」起來才能找出答案：',
+        '',
+        '🐾 腳印很大 → 體型大的',
+        '🧶 白色毛 → 白色的',
+        '📏 高處被打破 → 高的',
+        '',
+        '✨ 三個條件都符合的，就是真兇！',
+        '這就是「偵探思考」的精髓 🕵️',
+      ]);
+    }
+    if (this.showWinCard) this.drawWinCard(ctx, '抓到小偷了！');
+    this.drawEnterFade(ctx);
+  }
+}
+
+window.addEventListener('load', () => Game.init());
+</script>
+</body>
+</html>
