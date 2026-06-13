@@ -45,11 +45,25 @@ html, body { width: 100%; height: 100%; overflow: hidden;
   transition: all 0.2s; }
 #parent-mode:active { transform: scale(0.92); }
 #parent-mode.on { background: rgba(255, 215, 0, 0.3); border-color: rgba(255, 215, 0, 0.6); }
+#sound-toggle { position: fixed; top: 12px; right: 64px;
+  width: 44px; height: 44px;
+  background: rgba(255,255,255,0.1);
+  border: 1px solid rgba(255,255,255,0.2);
+  border-radius: 22px;
+  color: #fff; font-size: 20px;
+  display: flex; align-items: center; justify-content: center;
+  cursor: pointer; z-index: 40;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  transition: all 0.2s; }
+#sound-toggle:active { transform: scale(0.92); }
+#sound-toggle.off { opacity: 0.5; }
 </style>
 </head>
 <body>
 <div id="loading"><div class="cat">🐱</div><div class="text">準備中...</div></div>
 <canvas id="game-canvas"></canvas>
+<button id="sound-toggle" title="音效開關">🔊</button>
 <button id="parent-mode" title="家長模式">⚙️</button>
 <div id="debug">FPS: -- | Stage: 2</div>
 
@@ -87,6 +101,120 @@ class Tween {
 }
 
 /* ============================================================
+   🔊 音效系統（8-bit 合成，0 外部檔案）
+   ============================================================ */
+const Sound = {
+  ctx: null,
+  enabled: true,
+  masterVol: 0.25,
+
+  init() {
+    try {
+      this.enabled = localStorage.getItem('cat-adventure-sound') !== '0';
+    } catch (e) {}
+  },
+
+  // 第一次使用者互動時建立 AudioContext（iOS Safari 要求）
+  ensure() {
+    if (!this.ctx) {
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        this.ctx = new AC();
+      } catch (e) { return false; }
+    }
+    if (this.ctx.state === 'suspended') this.ctx.resume();
+    return true;
+  },
+
+  toggle() {
+    this.enabled = !this.enabled;
+    localStorage.setItem('cat-adventure-sound', this.enabled ? '1' : '0');
+    if (this.enabled) this.tap(); // 立即回饋
+    return this.enabled;
+  },
+
+  // 核心：播一個振盪器音（type: sine/square/triangle/sawtooth）
+  beep({ freq = 440, dur = 0.1, type = 'square', vol = 0.3, attack = 0.005, decay = 0.05, slide = 0 }) {
+    if (!this.enabled || !this.ensure()) return;
+    const c = this.ctx, t = c.currentTime;
+    const osc = c.createOscillator();
+    const gain = c.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t);
+    if (slide) osc.frequency.exponentialRampToValueAtTime(Math.max(20, freq + slide), t + dur);
+    gain.gain.setValueAtTime(0, t);
+    gain.gain.linearRampToValueAtTime(vol * this.masterVol, t + attack);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain).connect(c.destination);
+    osc.start(t);
+    osc.stop(t + dur + decay);
+  },
+
+  // 噪音（用 buffer）
+  noise({ dur = 0.15, vol = 0.2, filterFreq = 2000 }) {
+    if (!this.enabled || !this.ensure()) return;
+    const c = this.ctx, t = c.currentTime;
+    const buf = c.createBuffer(1, c.sampleRate * dur, c.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < data.length; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / data.length);
+    const src = c.createBufferSource(); src.buffer = buf;
+    const filter = c.createBiquadFilter(); filter.type = 'lowpass'; filter.frequency.value = filterFreq;
+    const gain = c.createGain(); gain.gain.value = vol * this.masterVol;
+    src.connect(filter).connect(gain).connect(c.destination);
+    src.start(t);
+  },
+
+  // 🎵 各種預設音效
+  tap() {
+    this.beep({ freq: 600, dur: 0.05, type: 'square', vol: 0.15 });
+  },
+  correct() {
+    // 兩個音「叮咚」上行
+    this.beep({ freq: 660, dur: 0.08, type: 'square', vol: 0.25 });
+    setTimeout(() => this.beep({ freq: 880, dur: 0.12, type: 'square', vol: 0.25 }), 80);
+  },
+  wrong() {
+    // 下行「噗」
+    this.beep({ freq: 200, dur: 0.18, type: 'sawtooth', vol: 0.25, slide: -80 });
+  },
+  cheer() {
+    // 過關小旋律：C-E-G-C 上行
+    const notes = [523, 659, 784, 1047];
+    notes.forEach((f, i) => {
+      setTimeout(() => this.beep({ freq: f, dur: 0.14, type: 'square', vol: 0.28 }), i * 90);
+    });
+    // 加一點亮粉
+    setTimeout(() => this.beep({ freq: 1568, dur: 0.2, type: 'triangle', vol: 0.2 }), 380);
+  },
+  boom() {
+    // 爆炸：噪音 + 低音
+    this.noise({ dur: 0.3, vol: 0.3, filterFreq: 800 });
+    this.beep({ freq: 80, dur: 0.25, type: 'sawtooth', vol: 0.3, slide: -40 });
+  },
+  pop() {
+    // 短促上揚（點開線索、解鎖小提示）
+    this.beep({ freq: 880, dur: 0.06, type: 'triangle', vol: 0.2, slide: 200 });
+  },
+
+  // 根據 showFeedback 顏色判斷對錯
+  feedback(color) {
+    if (!color) return;
+    // 紅橘色系 = 錯誤
+    if (/ff[5-7][0-9a-f]{3}|ffb[0-7]/i.test(color)) {
+      this.wrong();
+    }
+    // 金色 = 過關（讓 cheer 接手，這裡不播）
+    else if (/ffd[7-9]00|ffe[0-9a-f]{2}/i.test(color)) {
+      // 留給 cheer()
+    }
+    // 綠/藍 = 對/進度
+    else {
+      this.correct();
+    }
+  },
+};
+
+/* ============================================================
    🎮 遊戲核心
    ============================================================ */
 const Game = {
@@ -114,12 +242,20 @@ const Game = {
     } catch (e) {}
     this.updateParentBtn();
 
+    Sound.init();
+    this.updateSoundBtn();
+    document.getElementById('sound-toggle').addEventListener('click', () => {
+      Sound.toggle();
+      this.updateSoundBtn();
+    });
+
     const handleTap = (e) => {
       e.preventDefault();
       const t = e.touches ? e.touches[0] : e;
       const rect = this.canvas.getBoundingClientRect();
       const x = t.clientX - rect.left;
       const y = t.clientY - rect.top;
+      Sound.tap();
       if (this.currentScene && this.currentScene.onTap) {
         this.currentScene.onTap(x, y);
       }
@@ -143,6 +279,13 @@ const Game = {
     btn.classList.toggle('on', this.parentMode);
     btn.textContent = this.parentMode ? '🧑‍🏫' : '⚙️';
     btn.title = this.parentMode ? '家長模式：開' : '家長模式：關';
+  },
+
+  updateSoundBtn() {
+    const btn = document.getElementById('sound-toggle');
+    btn.classList.toggle('off', !Sound.enabled);
+    btn.textContent = Sound.enabled ? '🔊' : '🔇';
+    btn.title = Sound.enabled ? '音效：開' : '音效：關';
   },
 
   saveProgress() {
@@ -928,6 +1071,7 @@ class FireLevelScene {
     this.cat.setState('walk');
     this.catWalkTween = new Tween(this.catStartX, this.catTargetX, 2.0, Easing.easeInOutCubic, () => {
       this.cat.setState('cheer');
+      Sound.cheer();
       this.cleared = true;
       this.catWalking = false;
       // 觸發過關
@@ -965,6 +1109,7 @@ class FireLevelScene {
     this.feedbackText = text;
     this.feedbackColor = color;
     this.feedbackTimer = 2.5;
+    Sound.feedback(color);
   }
 
   update(dt) {
@@ -1674,19 +1819,33 @@ class FireLevel2Scene {
     this.successParticles = [];
 
     // 兩階段謎題狀態
-    this.puzzleStep = 1;          // 1: 火很強  2: 火變弱  3: 已解開
-    this.fireIntensity = 1.0;     // 1.0 = 滿火力, 0.4 = 變弱, 0 = 熄滅
+    this.puzzleStep = 1;          // 1: 火很強  2: 火滅了但黑煙塞門  3: 已解開
+    this.fireIntensity = 1.0;     // 1.0 = 滿火力, 0 = 熄滅
     this.intensityTween = null;
     this.flameFlash = 0;          // 風箱失敗時火焰瞬間放大
     this.steamAlpha = 0;          // 水蒸發特效
     this.steamTween = null;
+    this.smokeIntensity = 0;      // 第 2 階段黑煙濃度（0~1）
+    this.smokeTween = null;
+    this.smokePuffs = [];         // 第 2 階段黑煙粒子
+    this.iceBlock = null;         // 冰塊（從天空掉下）{ x, y, vy, landed, time }
+    this.frostMist = [];          // 冰塊融化的冷霧粒子
+    this.fireFreezing = 0;        // 火被冷凍程度 0~1（影響火的顏色：紅→藍→白）
 
-    // 道具：4 個（順序刻意打散，避免直覺按第一個）
+    // 🌡️ 環境溫度系統（核心：太熱才是阻礙，不是火堵路）
+    this.envHeat = 1.0;           // 環境熱度 0~1.5（1.0 = 熱到不行, 0 = 涼爽, >1 = 更熱）
+    this.envHeatTween = null;
+    this.heatHazeParticles = [];  // 熱氣（紅橘色粒子從地面冒上來）
+    this.catSweatDrops = [];      // 貓咪頭上的汗珠
+
+    // 道具：4 個（依「Anita 因果定律」— 水跟冰不能同題！）
+    // 正解：冰（降溫）；錯誤：石頭（燙手）、風（熱風）、水（蒸發更熱）
+    // 水留著是因為「水蒸發讓環境更悶熱」是真實物理，當錯誤選項超有教育意義
     this.items = [
       { id: 'rock',  icon: '🪨', name: '石頭',  used: false, x: 0, y: 0 },
+      { id: 'wind',  icon: '🌬️', name: '風箱',  used: false, x: 0, y: 0 },
       { id: 'water', icon: '💧', name: '水桶',  used: false, x: 0, y: 0 },
       { id: 'ice',   icon: '❄️', name: '冰塊',  used: false, x: 0, y: 0 },
-      { id: 'wind',  icon: '🌬️', name: '風箱',  used: false, x: 0, y: 0 },
     ];
 
     this.feedbackText = null;
@@ -1765,53 +1924,64 @@ class FireLevel2Scene {
   }
 
   useItem(item) {
-    // 步驟 1：火很強
+    // 步驟 1：環境太熱，貓咪過不去 → 必須降溫！
     if (this.puzzleStep === 1) {
       if (item.id === 'ice') {
-        // ✅ 正解：火變弱
+        // ✅ 正解：冰塊降溫整個環境
         item.used = true;
-        this.showFeedback('❄️ 冰降低了火的溫度，火變弱了！', '#4fc3f7');
-        this.intensityTween = new Tween(1.0, 0.4, 1.0, Easing.easeOutCubic, () => {
-          this.puzzleStep = 2;
+        this.showFeedback('❄️ 冰塊從天而降！環境正在降溫～', '#4fc3f7');
+        this.iceBlock = {
+          x: this.fireX,
+          y: -50,
+          vy: 0,
+          landed: false,
+          time: 0,
+          size: 35,
+        };
+      }
+      else if (item.id === 'water') {
+        // ❌ 水變蒸氣 → 環境更悶熱（真實物理：濕熱 > 乾熱）
+        this.showFeedback('💨 水瞬間蒸發成蒸氣，環境變得更悶熱了！', '#ff5252');
+        this.steamAlpha = 1.0;
+        this.steamTween = new Tween(1.0, 0, 1.5, Easing.easeOutCubic);
+        // 環境變更熱（1.0 → 1.3，然後慢慢回到 1.0）
+        this.envHeatTween = new Tween(this.envHeat, 1.3, 0.5, Easing.easeOutCubic, () => {
+          this.envHeatTween = new Tween(1.3, 1.0, 2.0, Easing.easeOutCubic);
         });
       }
       else if (item.id === 'wind') {
-        // ❌ 火被吹得更旺
-        this.showFeedback('💨 風讓火更旺了！火太強，先要降溫～', '#ff7043');
-        this.flameFlash = 1.0;
-      }
-      else if (item.id === 'water') {
-        // ❌ 水蒸發
-        this.showFeedback('💨 水都蒸發了！火太強，水沒辦法滅～', '#ffb74d');
-        this.steamAlpha = 1.0;
-        this.steamTween = new Tween(1.0, 0, 1.5, Easing.easeOutCubic);
+        // ❌ 熱風（沙漠原理 — 高溫環境的風是熱的）
+        this.showFeedback('🌬️ 風是熱的！像吹風機一樣燙～', '#ff5252');
+        this.envHeatTween = new Tween(this.envHeat, 1.2, 0.4, Easing.easeOutCubic, () => {
+          this.envHeatTween = new Tween(1.2, 1.0, 1.8, Easing.easeOutCubic);
+        });
       }
       else if (item.id === 'rock') {
-        this.showFeedback('🔥 石頭被燒紅了！這個沒用～', '#ff7043');
+        // ❌ 石頭被烤燙
+        this.showFeedback('🔥 石頭被烤到燙手！碰不得～', '#ff7043');
       }
     }
-    // 步驟 2：火變弱了
+    // 步驟 2：火滅了但餘燼冒出黑煙塞住通道 → 用風吹散煙
     else if (this.puzzleStep === 2) {
       if (item.id === 'wind') {
-        // ✅ 正解：吹熄
+        // ✅ 正解：風吹散黑煙
         item.used = true;
-        this.showFeedback('🌬️ 風吹散了殘火，門打開了！', '#81c784');
-        this.intensityTween = new Tween(0.4, 0, 0.8, Easing.easeOutCubic, () => {
+        this.showFeedback('🌬️ 風吹散了黑煙，看到通道了！', '#81c784');
+        this.smokeTween = new Tween(this.smokeIntensity, 0, 1.0, Easing.easeOutCubic, () => {
           this.puzzleStep = 3;
-          // 開門動畫
           this.doorTween = new Tween(0, 1, 0.8, Easing.easeOutCubic, () => {
             setTimeout(() => this.startWalk(), 300);
           });
         });
       }
-      else if (item.id === 'ice') {
-        this.showFeedback('❄️ 火已經很弱了，需要不一樣的方法～', '#4fc3f7');
-      }
       else if (item.id === 'water') {
-        this.showFeedback('💧 火太小，水會變成小水窪～試試別的', '#ffb74d');
+        this.showFeedback('💧 水滅得了火，但滅不了煙！煙是氣體～', '#ffb74d');
+      }
+      else if (item.id === 'ice') {
+        this.showFeedback('❄️ 環境已經涼了，但煙還是擋路～', '#4fc3f7');
       }
       else if (item.id === 'rock') {
-        this.showFeedback('🪨 石頭還是沒用啦！', '#ff7043');
+        this.showFeedback('🪨 丟石頭只會被煙嗆到～', '#ff7043');
       }
     }
   }
@@ -1821,6 +1991,7 @@ class FireLevel2Scene {
     this.cat.setState('walk');
     this.catWalkTween = new Tween(this.catStartX, this.catTargetX, 2.0, Easing.easeInOutCubic, () => {
       this.cat.setState('cheer');
+      Sound.cheer();
       this.cleared = true;
       this.catWalking = false;
       Game.progress.fireLevel = Math.max(Game.progress.fireLevel || 0, 2);
@@ -1849,6 +2020,7 @@ class FireLevel2Scene {
 
   showFeedback(text, color) {
     this.feedbackText = text; this.feedbackColor = color; this.feedbackTimer = 2.5;
+    Sound.feedback(color);
   }
 
   update(dt) {
@@ -1862,6 +2034,152 @@ class FireLevel2Scene {
     if (this.steamTween && !this.steamTween.done) {
       this.steamAlpha = this.steamTween.update(dt);
     }
+    if (this.smokeTween && !this.smokeTween.done) {
+      this.smokeIntensity = this.smokeTween.update(dt);
+    }
+
+    // ❄️ 冰塊掉落物理 + 融化動畫
+    if (this.iceBlock) {
+      const ib = this.iceBlock;
+      ib.time += dt;
+      if (!ib.landed) {
+        // 自由落體
+        ib.vy += 600 * dt;
+        ib.y += ib.vy * dt;
+        if (ib.y >= this.groundY - 10) {
+          // 撞到火！
+          ib.y = this.groundY - 10;
+          ib.landed = true;
+          ib.time = 0; // 重設計時器，開始融化
+          this.showFeedback('💥 冰塊砸進火裡，融化成冷霧！', '#81d4fa');
+          Sound.boom();
+          // 觸發 30 顆冷霧粒子大爆發
+          for (let i = 0; i < 30; i++) {
+            const ang = Math.random() * Math.PI * 2;
+            const sp = 80 + Math.random() * 120;
+            this.frostMist.push({
+              x: ib.x, y: ib.y,
+              vx: Math.cos(ang) * sp,
+              vy: Math.sin(ang) * sp - 40,
+              life: 0,
+              maxLife: 1.2 + Math.random() * 0.8,
+              size: 8 + Math.random() * 15,
+              burst: true,
+            });
+          }
+        }
+      } else {
+        // 已落地：持續放出冷霧 + 火被冷凍
+        if (ib.time < 1.5 && Math.random() < 0.6) {
+          this.frostMist.push({
+            x: ib.x + (Math.random() - 0.5) * 30,
+            y: ib.y - 5,
+            vx: (Math.random() - 0.5) * 40,
+            vy: -30 - Math.random() * 30,
+            life: 0,
+            maxLife: 1.0 + Math.random() * 0.6,
+            size: 6 + Math.random() * 10,
+            burst: false,
+          });
+        }
+        // 冷凍火焰（紅 → 藍 → 白 → 消失）
+        this.fireFreezing = Math.min(1, ib.time * 0.8);
+        this.fireIntensity = Math.max(0, 1 - ib.time * 0.7);
+        // 冰塊本身慢慢縮小（融化）
+        ib.size = Math.max(0, 35 - ib.time * 25);
+
+        // 火完全熄滅 → 進入步驟 2（冒黑煙）
+        if (this.fireIntensity <= 0.01 && this.puzzleStep === 1) {
+          this.puzzleStep = 2;
+          this.smokeIntensity = 0;
+          this.smokeTween = new Tween(0, 1, 0.8, Easing.easeOutCubic);
+          // 🌡️ 環境降溫！熱浪退去
+          this.envHeatTween = new Tween(this.envHeat, 0.1, 1.5, Easing.easeOutCubic);
+          this.showFeedback('💨 環境涼了！但餘燼冒出黑煙擋住通道...', '#81c784');
+        }
+        // 冰塊完全融化 → 清掉
+        if (ib.size <= 0 && ib.time > 2.5) {
+          this.iceBlock = null;
+        }
+      }
+    }
+    // 冷霧粒子更新
+    for (const m of this.frostMist) {
+      m.life += dt;
+      m.x += m.vx * dt;
+      m.y += m.vy * dt;
+      m.vx *= 0.95;
+      m.vy *= 0.95;
+      m.vy += 30 * dt; // 輕微重力（霧會慢慢沉）
+    }
+    this.frostMist = this.frostMist.filter(m => m.life < m.maxLife);
+
+    // 🌡️ 環境溫度動畫
+    if (this.envHeatTween && !this.envHeatTween.done) {
+      this.envHeat = this.envHeatTween.update(dt);
+    }
+
+    // 🔥 熱氣粒子（從地面冒紅橘色霧）— 環境越熱，粒子越多
+    if (this.envHeat > 0.2 && Math.random() < this.envHeat * 0.8) {
+      this.heatHazeParticles.push({
+        x: Math.random() * Game.width,
+        y: this.groundY + 5,
+        vy: -25 - Math.random() * 30 * this.envHeat,
+        vx: (Math.random() - 0.5) * 10,
+        life: 0,
+        maxLife: 1.5 + Math.random() * 1.0,
+        size: 8 + Math.random() * 12,
+        hue: 10 + Math.random() * 20, // 紅橘色相
+      });
+    }
+    for (const h of this.heatHazeParticles) {
+      h.life += dt;
+      h.x += h.vx * dt;
+      h.y += h.vy * dt;
+      h.size += dt * 12;
+    }
+    this.heatHazeParticles = this.heatHazeParticles.filter(h => h.life < h.maxLife);
+
+    // 💦 貓咪汗珠（環境熱 + 還在步驟 1 才流汗）
+    if (this.cat && this.envHeat > 0.5 && this.puzzleStep === 1) {
+      if (Math.random() < this.envHeat * 0.15) {
+        this.catSweatDrops.push({
+          x: this.cat.x + (Math.random() - 0.5) * 30,
+          y: this.cat.y - 50 - Math.random() * 20,
+          vy: 50 + Math.random() * 40,
+          life: 0,
+          maxLife: 0.8 + Math.random() * 0.4,
+        });
+      }
+    }
+    for (const d of this.catSweatDrops) {
+      d.life += dt;
+      d.y += d.vy * dt;
+      d.vy += 150 * dt;
+    }
+    this.catSweatDrops = this.catSweatDrops.filter(d => d.life < d.maxLife);
+    // 第 2 階段：持續產生黑煙粒子
+    if (this.puzzleStep === 2 && this.smokeIntensity > 0.05) {
+      if (Math.random() < 0.5) {
+        this.smokePuffs.push({
+          x: this.fireX + (Math.random() - 0.5) * 40,
+          y: this.groundY - 5,
+          vx: (Math.random() - 0.5) * 15,
+          vy: -20 - Math.random() * 25,
+          life: 0,
+          maxLife: 2.0 + Math.random() * 1.5,
+          size: 15 + Math.random() * 25,
+        });
+      }
+    }
+    for (const p of this.smokePuffs) {
+      p.life += dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy *= 0.985; // 越飄越慢
+      p.size += dt * 8; // 越飄越大
+    }
+    this.smokePuffs = this.smokePuffs.filter(p => p.life < p.maxLife);
     if (this.doorTween && !this.doorTween.done) {
       this.doorOpening = this.doorTween.update(dt);
     }
@@ -1949,6 +2267,9 @@ class FireLevel2Scene {
 
     // 🔥 火焰封印
     if (this.fireIntensity > 0.01) this.drawFire(ctx);
+    if (this.frostMist.length > 0) this.drawFrostMist(ctx);
+    if (this.iceBlock) this.drawIceBlock(ctx);
+    if (this.smokePuffs.length > 0) this.drawSmoke(ctx);
 
     // 蒸氣（水失敗）
     if (this.steamAlpha > 0) {
@@ -1964,8 +2285,53 @@ class FireLevel2Scene {
       }
     }
 
+    // 🔥 熱氣粒子（從地面冒紅橘色霧）
+    if (this.heatHazeParticles.length > 0) {
+      for (const h of this.heatHazeParticles) {
+        const fade = 1 - h.life / h.maxLife;
+        const a = fade * 0.45 * Math.min(1, this.envHeat);
+        const grad = ctx.createRadialGradient(h.x, h.y, 0, h.x, h.y, h.size);
+        grad.addColorStop(0, `hsla(${h.hue}, 90%, 55%, ${a})`);
+        grad.addColorStop(1, `hsla(${h.hue}, 90%, 50%, 0)`);
+        ctx.fillStyle = grad;
+        ctx.beginPath(); ctx.arc(h.x, h.y, h.size, 0, Math.PI*2); ctx.fill();
+      }
+    }
+
+    // 🌫️ 熱浪扭曲遮罩（紅色半透明蓋整個畫面，越熱越紅）
+    if (this.envHeat > 0.3) {
+      const heatA = Math.min(0.35, (this.envHeat - 0.3) * 0.4);
+      const grad = ctx.createLinearGradient(0, 0, 0, H);
+      grad.addColorStop(0, `rgba(255, 80, 20, ${heatA * 0.7})`);
+      grad.addColorStop(0.5, `rgba(255, 120, 40, ${heatA})`);
+      grad.addColorStop(1, `rgba(255, 60, 10, ${heatA * 1.2})`);
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, W, H);
+    }
+
     // 虎紋貓
     if (this.cat) this.cat.draw(ctx);
+
+    // 💦 貓咪汗珠（藍水滴）
+    if (this.catSweatDrops.length > 0) {
+      for (const d of this.catSweatDrops) {
+        const fade = 1 - d.life / d.maxLife;
+        ctx.fillStyle = `rgba(120, 200, 255, ${fade * 0.9})`;
+        ctx.beginPath();
+        ctx.ellipse(d.x, d.y, 3, 5, 0, 0, Math.PI*2);
+        ctx.fill();
+        ctx.strokeStyle = `rgba(80, 140, 200, ${fade})`;
+        ctx.lineWidth = 0.8;
+        ctx.stroke();
+      }
+    }
+    // 🥵 貓咪「太熱了」表情泡泡
+    if (this.cat && this.envHeat > 0.6 && this.puzzleStep === 1) {
+      const fy = this.cat.y - 75 + Math.sin(this.time * 3) * 2;
+      ctx.font = '20px -apple-system';
+      ctx.textAlign = 'center';
+      ctx.fillText('🥵', this.cat.x + 30, fy);
+    }
 
     // 火星
     for (const e of this.emberParticles) {
@@ -1998,10 +2364,47 @@ class FireLevel2Scene {
     if (!this.cleared && !this.catWalking) {
       ctx.fillStyle = 'rgba(0,0,0,0.4)';
       ctx.fillRect(W/2 - 90, 56, 180, 22);
-      ctx.fillStyle = this.puzzleStep === 1 ? '#ff7043' : '#81c784';
+      ctx.fillStyle = this.puzzleStep === 1 ? '#ff7043' : '#424242';
       ctx.font = 'bold 13px -apple-system, "PingFang TC"';
-      const stepText = this.puzzleStep === 1 ? '步驟 1/2：火太強，先讓火變弱' : '步驟 2/2：火變弱了，把它弄熄';
+      const stepText = this.puzzleStep === 1 ? '步驟 1/2：太熱了！想辦法降溫' : '步驟 2/2：黑煙擋路，把煙清掉';
       ctx.fillText(stepText, W/2, 71);
+    }
+
+    // 🌡️ 溫度計（右側）
+    if (!this.cleared && !this.catWalking) {
+      const tcX = W - 35;
+      const tcY = H * 0.5;
+      const tcH = 140;
+      // 玻璃外殼
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.fillRect(tcX - 12, tcY - tcH/2, 24, tcH);
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+      ctx.strokeRect(tcX - 12, tcY - tcH/2, 24, tcH);
+      // 溫度條（依 envHeat 0~1.5）
+      const heatPct = Math.min(1, this.envHeat / 1.5);
+      const heatH = tcH * heatPct;
+      let heatColor;
+      if (this.envHeat > 1.0) heatColor = '#ff1744';      // 危險紅
+      else if (this.envHeat > 0.5) heatColor = '#ff5722'; // 熱橘
+      else if (this.envHeat > 0.2) heatColor = '#ffb74d'; // 溫黃
+      else heatColor = '#4fc3f7';                          // 涼藍
+      ctx.fillStyle = heatColor;
+      ctx.fillRect(tcX - 9, tcY + tcH/2 - heatH, 18, heatH);
+      // 標籤
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 10px -apple-system, "PingFang TC"';
+      ctx.textAlign = 'center';
+      ctx.fillText('🥵', tcX, tcY - tcH/2 - 6);
+      ctx.fillText('🥶', tcX, tcY + tcH/2 + 14);
+      // 危險警示
+      if (this.envHeat > 1.0) {
+        const blink = Math.sin(this.time * 6) > 0;
+        if (blink) {
+          ctx.fillStyle = '#ff1744';
+          ctx.font = 'bold 11px -apple-system, "PingFang TC"';
+          ctx.fillText('💥', tcX, tcY - tcH/2 + 14);
+        }
+      }
     }
 
     // 返回鈕
@@ -2094,11 +2497,22 @@ class FireLevel2Scene {
     ctx.fillStyle = glow;
     ctx.fillRect(fx - 80, fy - flameH - 20, 160, flameH + 40);
 
-    // 火焰本體（多層）
+    // 火焰本體（多層）— 顏色會根據 fireFreezing 漸變（紅→藍→白）
+    const f = this.fireFreezing;
+    const lerp = (a, b, t) => Math.round(a + (b - a) * t);
     const layers = [
-      { color: 'rgba(244, 67, 54, 0.85)', wScale: 1.0, hScale: 1.0 },
-      { color: 'rgba(255, 152, 0, 0.85)', wScale: 0.75, hScale: 0.85 },
-      { color: 'rgba(255, 235, 59, 0.85)', wScale: 0.45, hScale: 0.65 },
+      {
+        color: `rgba(${lerp(244, 100, f)}, ${lerp(67, 180, f)}, ${lerp(54, 255, f)}, 0.85)`,
+        wScale: 1.0, hScale: 1.0
+      },
+      {
+        color: `rgba(${lerp(255, 150, f)}, ${lerp(152, 220, f)}, ${lerp(0, 255, f)}, 0.85)`,
+        wScale: 0.75, hScale: 0.85
+      },
+      {
+        color: `rgba(${lerp(255, 220, f)}, ${lerp(235, 240, f)}, ${lerp(59, 255, f)}, 0.85)`,
+        wScale: 0.45, hScale: 0.65
+      },
     ];
     for (const layer of layers) {
       const fw = flameW * layer.wScale;
@@ -2130,6 +2544,80 @@ class FireLevel2Scene {
         ctx.fillRect(-2, -15, 4, 10);
       }
       ctx.restore();
+    }
+  }
+
+  drawIceBlock(ctx) {
+    const ib = this.iceBlock;
+    if (ib.size <= 0) return;
+    const sz = ib.size;
+    // 冰塊本體（藍白色立方體，帶光澤）
+    ctx.save();
+    ctx.translate(ib.x, ib.y);
+    // 陰影
+    if (!ib.landed) {
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+      ctx.beginPath();
+      ctx.ellipse(0, this.groundY - ib.y, sz * 0.8, sz * 0.2, 0, 0, Math.PI*2);
+      ctx.fill();
+    }
+    // 冰塊主體（漸層）
+    const grad = ctx.createLinearGradient(-sz, -sz, sz, sz);
+    grad.addColorStop(0, '#ffffff');
+    grad.addColorStop(0.4, '#bbdefb');
+    grad.addColorStop(1, '#4fc3f7');
+    ctx.fillStyle = grad;
+    ctx.fillRect(-sz, -sz, sz*2, sz*2);
+    // 邊框
+    ctx.strokeStyle = '#0277bd';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(-sz, -sz, sz*2, sz*2);
+    // 光澤
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+    ctx.fillRect(-sz + 4, -sz + 4, sz * 0.5, sz * 0.3);
+    ctx.restore();
+  }
+
+  drawFrostMist(ctx) {
+    // 冷霧：藍白色光暈粒子，從冰塊位置擴散
+    for (const m of this.frostMist) {
+      const fade = 1 - m.life / m.maxLife;
+      const a = fade * 0.7;
+      const grad = ctx.createRadialGradient(m.x, m.y, 0, m.x, m.y, m.size);
+      grad.addColorStop(0, `rgba(225, 245, 254, ${a})`);
+      grad.addColorStop(0.5, `rgba(129, 212, 250, ${a * 0.5})`);
+      grad.addColorStop(1, 'rgba(79, 195, 247, 0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(m.x, m.y, m.size, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  drawSmoke(ctx) {
+    // 黑煙：濃濃的灰黑色雲團從原本火的位置升起，往門口飄
+    for (const p of this.smokePuffs) {
+      const fade = 1 - p.life / p.maxLife;
+      const a = fade * 0.7 * Math.min(1, this.smokeIntensity * 1.5);
+      // 外層淡灰（光暈）
+      const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.size);
+      grad.addColorStop(0, `rgba(60, 60, 60, ${a})`);
+      grad.addColorStop(0.5, `rgba(40, 40, 40, ${a * 0.6})`);
+      grad.addColorStop(1, 'rgba(40, 40, 40, 0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI*2);
+      ctx.fill();
+    }
+    // 在門口畫一層遮罩（暗示煙塞住門）
+    if (this.smokeIntensity > 0.3) {
+      const W = Game.width;
+      const a = this.smokeIntensity * 0.35;
+      const grad = ctx.createLinearGradient(0, this.groundY - 80, 0, this.groundY);
+      grad.addColorStop(0, `rgba(30, 30, 30, 0)`);
+      grad.addColorStop(1, `rgba(30, 30, 30, ${a})`);
+      ctx.fillStyle = grad;
+      ctx.fillRect(this.doorX - 50, this.groundY - 80, 100, 80);
     }
   }
 
@@ -2292,12 +2780,14 @@ class FireLevelBase {
   }
   showFeedback(text, color) {
     this.feedbackText = text; this.feedbackColor = color || '#fff'; this.feedbackTimer = 2.5;
+    Sound.feedback(color);
   }
   startWalk(targetX, onArrive) {
     this.catWalking = true;
     this.cat.setState('walk');
     this.catWalkTween = new Tween(this.catStartX, targetX || this.catTargetX, 2.0, Easing.easeInOutCubic, () => {
       this.cat.setState('cheer');
+      Sound.cheer();
       this.cleared = true;
       this.catWalking = false;
       Game.progress[this.continent + 'Level'] = Math.max(Game.progress[this.continent + 'Level'] || 0, this.levelNum);
@@ -2694,10 +3184,10 @@ class FireLevel4Scene extends FireLevelBase {
     if (this.baseTap(x, y) !== null) return;
     if (this.hatched) return;
     const W = Game.width, H = Game.height;
-    // 兩個按鈕
+    // 兩個按鈕（拉近一點，方便手指操作）
     const btnY = H - 80;
-    const btnHeat = { x: W*0.35, y: btnY, r: 42 };
-    const btnCool = { x: W*0.65, y: btnY, r: 42 };
+    const btnHeat = { x: W*0.42, y: btnY, r: 42 };
+    const btnCool = { x: W*0.58, y: btnY, r: 42 };
     const dh = x - btnHeat.x, dh2 = y - btnHeat.y;
     const dc = x - btnCool.x, dc2 = y - btnCool.y;
     if (dh*dh + dh2*dh2 < btnHeat.r*btnHeat.r) { this.heating = true; this.cooling = false; }
@@ -2721,6 +3211,7 @@ class FireLevel4Scene extends FireLevelBase {
         this.hatched = true;
         this.babyDragon = { x: this.eggX, y: this.eggY, time: 0 };
         this.showFeedback('🐉 火龍蛋孵化了！', '#ffd700');
+        Sound.cheer();
         setTimeout(() => this.startWalk(), 1800);
       }
     } else {
@@ -2876,8 +3367,8 @@ class FireLevel4Scene extends FireLevelBase {
     // 控制按鈕
     const btnY = H - 80;
     [
-      { x: W*0.35, label: '🔥 加熱', color: '#ff5722', active: this.heating },
-      { x: W*0.65, label: '❄️ 降溫', color: '#03a9f4', active: this.cooling },
+      { x: W*0.42, label: '🔥 加熱', color: '#ff5722', active: this.heating },
+      { x: W*0.58, label: '❄️ 降溫', color: '#03a9f4', active: this.cooling },
     ].forEach(btn => {
       ctx.fillStyle = btn.active ? btn.color : 'rgba(255,255,255,0.15)';
       ctx.beginPath(); ctx.arc(btn.x, btnY, 42, 0, Math.PI*2); ctx.fill();
@@ -2916,19 +3407,20 @@ class FireLevel4Scene extends FireLevelBase {
 class FireLevel5Scene extends FireLevelBase {
   constructor() {
     super(5);
-    // 5 個火球。編號刻意打亂，玩家必須看箭頭才能找出正解
-    // 位置 idx: 0  1  2  3  4
-    // 顯示編號:  3  1  4  2  5
-    // 連鎖路徑（label 視角）：3 → 2 → 1 → 5；3 → 4 → 5
-    // 只有點「3」才能炸光全部
+    // 6 個火球。編號刻意打亂，玩家必須看箭頭才能找出正解
+    // 位置 idx: 0  1  2  3  4  5
+    // 顯示編號:  4  6  1  3  5  2
+    // 設計：只有點「3」(idx 3) 能炸光全部 6 顆
+    // 陷阱：點「6」(idx 1) 看起來連線多，但只能炸 5 顆
     this.fireballs = [];
-    this.labels = [3, 1, 4, 2, 5];   // idx → 顯示編號
+    this.labels = [4, 6, 1, 3, 5, 2];   // idx → 顯示編號
     this.connections = [
-      [3, 2],   // idx 0 (label 3) → idx 3 (label 2), idx 2 (label 4)
-      [4],      // idx 1 (label 1) → idx 4 (label 5)
-      [4],      // idx 2 (label 4) → idx 4 (label 5)
-      [1],      // idx 3 (label 2) → idx 1 (label 1)
-      [],       // idx 4 (label 5) → 無
+      [2],         // idx 0 (label 4) → idx 2 (label 1)
+      [0, 4],      // idx 1 (label 6) → idx 0 (label 4), idx 4 (label 5)  ← 陷阱
+      [5],         // idx 2 (label 1) → idx 5 (label 2)
+      [1, 0],      // idx 3 (label 3) → idx 1 (label 6), idx 0 (label 4)  ← ✅ 正解起點
+      [],          // idx 4 (label 5) → 無
+      [],          // idx 5 (label 2) → 無
     ];
     this.exploded = new Set();
     this.tapped = false;
@@ -2936,11 +3428,11 @@ class FireLevel5Scene extends FireLevelBase {
   layout() {
     this.baseLayout();
     const W = Game.width, H = Game.height;
-    // 5 個火球，在洞穴頂部
-    const ys = [H*0.32, H*0.42, H*0.30, H*0.45, H*0.34];
-    const xs = [W*0.2, W*0.32, W*0.46, W*0.62, W*0.78];
+    // 6 個火球，交錯排列在洞穴頂部
+    const ys = [H*0.32, H*0.45, H*0.30, H*0.42, H*0.34, H*0.46];
+    const xs = [W*0.15, W*0.28, W*0.42, W*0.55, W*0.70, W*0.85];
     if (this.fireballs.length === 0) {
-      for (let i = 0; i < 5; i++) {
+      for (let i = 0; i < 6; i++) {
         this.fireballs.push({ x: xs[i], y: ys[i], idx: i, exploding: false, explodeTime: 0 });
       }
     } else {
@@ -2976,8 +3468,10 @@ class FireLevel5Scene extends FireLevelBase {
     explode(idx, 0);
     // 1.5 秒後檢查
     setTimeout(() => {
-      if (this.exploded.size === 5) {
+      if (this.exploded.size === 6) {
         this.showFeedback('🎆 全部炸光！', '#ffd700');
+        Sound.boom();
+        setTimeout(() => Sound.cheer(), 300);
         setTimeout(() => this.startWalk(), 600);
       } else {
         this.showFeedback(`💣 只炸到 ${this.exploded.size} 個！再試試別的順序`, '#ff7043');
@@ -3114,6 +3608,18 @@ class FireBossScene extends FireLevelBase {
     this.heating = false;
     this.cooling = false;
     this.coolProgress = 0;
+
+    // 🎬 P2 特效（冰塊掉落 + 冷霧 + 黑煙遮罩 + 環境熱度）
+    this.bossIceBlock = null;
+    this.bossFrostMist = [];
+    this.bossSmokePuffs = [];
+    this.bossSmokeAlpha = 0;     // 0~1，遮住魔王的黑煙濃度
+    this.bossFireFreezing = 0;   // 魔王身上火盾被冷凍程度
+    // 🌡️ BOSS 環境熱度系統（魔王散發熱浪）
+    this.bossEnvHeat = 0;          // P2 進入時拉到 1.0
+    this.bossEnvHeatTween = null;
+    this.bossHeatHaze = [];
+    this.bossCatSweat = [];
   }
   layout() {
     this.baseLayout();
@@ -3154,7 +3660,9 @@ class FireBossScene extends FireLevelBase {
             this.showFeedback('💧 水蓋過火盾！魔王受傷', '#4fc3f7');
             setTimeout(() => {
               this.bossPhase = 2;
-              this.showPhaseHint('🐲 第 2 階段：他開始噴火咆哮！\n單一道具不夠，要照順序兩步驟才能封住');
+              this.showPhaseHint('🐲 第 2 階段：他散發超高熱浪！\n環境太熱貓咪受不了，先降溫才能繼續');
+              // 環境變熱
+              this.bossEnvHeatTween = new Tween(0, 1.0, 0.8, Easing.easeOutCubic);
             }, 1200);
           } else {
             this.showFeedback('❌ 沒用！火盾沒破，再想想', '#ff7043');
@@ -3171,18 +3679,50 @@ class FireBossScene extends FireLevelBase {
           if (this.p2Step === 1 && it.id === 'ice') {
             it.used = true;
             this.p2Step = 2;
-            this.showFeedback('❄️ 火變弱了！再吹熄它', '#4fc3f7');
+            this.showFeedback('❄️ 冰塊從天而降！環境正在降溫～', '#4fc3f7');
+            // 啟動冰塊掉落 + 冷霧爆發
+            this.bossIceBlock = {
+              x: this.bossX, y: -50, vy: 0,
+              landed: false, time: 0, size: 35,
+            };
+            // 降溫！熱浪退去
+            this.bossEnvHeatTween = new Tween(this.bossEnvHeat, 0, 1.5, Easing.easeOutCubic);
           } else if (this.p2Step === 2 && it.id === 'wind') {
             it.used = true;
             this.damageBoss();
-            this.showFeedback('🌬️ 風吹熄殘火！魔王再受重創', '#81c784');
+            this.showFeedback('🌬️ 風吹散了黑煙，看到魔王本體！', '#81c784');
+            // 黑煙快速消散
+            this.bossSmokeAlpha = 0; // 立即清掉遮罩
+            this.bossSmokePuffs = []; // 清掉煙粒子
             setTimeout(() => {
               this.bossPhase = 3;
-              this.bossHeat = 30;
-              this.showPhaseHint('🐲 最終階段：魔王體溫失控\n讓他穩定在綠色區域才能徹底制服他');
+              this.bossHeat = 80;
+              this.showPhaseHint('🐲 最終階段：魔王體溫失控狂飆\n按❄️降溫讓他穩定在綠色區域才能徹底制服他');
             }, 1200);
+          } else if (this.p2Step === 1) {
+            // P2 第 1 步，水/風會讓環境更熱
+            if (it.id === 'water') {
+              this.showFeedback('💨 水蒸發成蒸氣，環境更悶熱了！', '#ff5252');
+              this.bossEnvHeatTween = new Tween(this.bossEnvHeat, 1.3, 0.4, Easing.easeOutCubic, () => {
+                this.bossEnvHeatTween = new Tween(1.3, 1.0, 1.8, Easing.easeOutCubic);
+              });
+            } else if (it.id === 'wind') {
+              this.showFeedback('🌬️ 風是熱的！像吹風機一樣燙～', '#ff5252');
+              this.bossEnvHeatTween = new Tween(this.bossEnvHeat, 1.2, 0.4, Easing.easeOutCubic, () => {
+                this.bossEnvHeatTween = new Tween(1.2, 1.0, 1.8, Easing.easeOutCubic);
+              });
+            } else if (it.id === 'rock') {
+              this.showFeedback('🔥 石頭被烤到燙手！碰不得～', '#ff7043');
+            }
           } else {
-            this.showFeedback('❌ 順序錯了！想想步驟', '#ff7043');
+            // P2 第 2 步，錯誤選項
+            if (it.id === 'water') {
+              this.showFeedback('💧 水滅不了煙！煙是氣體～', '#ffb74d');
+            } else if (it.id === 'ice') {
+              this.showFeedback('❄️ 環境已經涼了，但煙還是擋路～', '#4fc3f7');
+            } else if (it.id === 'rock') {
+              this.showFeedback('🪨 丟石頭只會被煙嗆到～', '#ff7043');
+            }
           }
           return;
         }
@@ -3191,8 +3731,8 @@ class FireBossScene extends FireLevelBase {
     else if (this.bossPhase === 3) {
       const W = Game.width, H = Game.height;
       const btnY = H - 80;
-      const btnHeat = { x: W*0.35, y: btnY, r: 42 };
-      const btnCool = { x: W*0.65, y: btnY, r: 42 };
+      const btnHeat = { x: W*0.42, y: btnY, r: 42 };
+      const btnCool = { x: W*0.58, y: btnY, r: 42 };
       const dh = x - btnHeat.x, dh2 = y - btnHeat.y;
       const dc = x - btnCool.x, dc2 = y - btnCool.y;
       if (dh*dh + dh2*dh2 < btnHeat.r*btnHeat.r) { this.heating = true; this.cooling = false; }
@@ -3207,6 +3747,8 @@ class FireBossScene extends FireLevelBase {
       this.bossDying = true;
       this.bossDieTime = this.time;
       this.showFeedback('🎊 烈焰魔王被打敗了！', '#ffd700');
+      Sound.boom();
+      setTimeout(() => Sound.cheer(), 400);
       setTimeout(() => this.startWalk(), 2200);
     }
   }
@@ -3215,11 +3757,123 @@ class FireBossScene extends FireLevelBase {
     if (this.flashTime > 0) this.flashTime -= dt;
     if (this.phaseHintTimer > 0) this.phaseHintTimer -= dt;
 
-    // P3：溫度控制
+    // 🎬 P2 冰塊掉落 + 融化動畫
+    if (this.bossIceBlock) {
+      const ib = this.bossIceBlock;
+      ib.time += dt;
+      if (!ib.landed) {
+        ib.vy += 600 * dt;
+        ib.y += ib.vy * dt;
+        if (ib.y >= this.bossY) {
+          ib.y = this.bossY;
+          ib.landed = true;
+          ib.time = 0;
+          Sound.boom();
+          // 30 顆冷霧爆發
+          for (let i = 0; i < 30; i++) {
+            const ang = Math.random() * Math.PI * 2;
+            const sp = 80 + Math.random() * 120;
+            this.bossFrostMist.push({
+              x: ib.x, y: ib.y,
+              vx: Math.cos(ang) * sp,
+              vy: Math.sin(ang) * sp - 40,
+              life: 0, maxLife: 1.2 + Math.random() * 0.8,
+              size: 8 + Math.random() * 15,
+            });
+          }
+        }
+      } else {
+        if (ib.time < 1.5 && Math.random() < 0.6) {
+          this.bossFrostMist.push({
+            x: ib.x + (Math.random() - 0.5) * 30,
+            y: ib.y - 5,
+            vx: (Math.random() - 0.5) * 40,
+            vy: -30 - Math.random() * 30,
+            life: 0, maxLife: 1.0 + Math.random() * 0.6,
+            size: 6 + Math.random() * 10,
+          });
+        }
+        // 火盾被凍 + 黑煙升起遮住魔王
+        this.bossFireFreezing = Math.min(1, ib.time * 0.8);
+        this.bossSmokeAlpha = Math.min(1, ib.time * 0.6);
+        ib.size = Math.max(0, 35 - ib.time * 25);
+        if (ib.size <= 0 && ib.time > 2.5) {
+          this.bossIceBlock = null;
+        }
+      }
+    }
+    // 冷霧粒子更新
+    for (const m of this.bossFrostMist) {
+      m.life += dt;
+      m.x += m.vx * dt; m.y += m.vy * dt;
+      m.vx *= 0.95; m.vy *= 0.95;
+      m.vy += 30 * dt;
+    }
+    this.bossFrostMist = this.bossFrostMist.filter(m => m.life < m.maxLife);
+
+    // 🌡️ BOSS 環境熱度動畫 + 熱氣粒子 + 貓咪汗珠
+    if (this.bossEnvHeatTween && !this.bossEnvHeatTween.done) {
+      this.bossEnvHeat = this.bossEnvHeatTween.update(dt);
+    }
+    if (this.bossEnvHeat > 0.2 && Math.random() < this.bossEnvHeat * 0.8) {
+      this.bossHeatHaze.push({
+        x: Math.random() * Game.width,
+        y: this.groundY + 5,
+        vy: -25 - Math.random() * 30 * this.bossEnvHeat,
+        vx: (Math.random() - 0.5) * 10,
+        life: 0, maxLife: 1.5 + Math.random(),
+        size: 8 + Math.random() * 12,
+        hue: 10 + Math.random() * 20,
+      });
+    }
+    for (const h of this.bossHeatHaze) {
+      h.life += dt; h.x += h.vx * dt; h.y += h.vy * dt;
+      h.size += dt * 12;
+    }
+    this.bossHeatHaze = this.bossHeatHaze.filter(h => h.life < h.maxLife);
+
+    // 貓咪汗珠（P2 + 環境熱才流汗）
+    if (this.cat && this.bossEnvHeat > 0.5 && this.bossPhase === 2 && this.p2Step === 1) {
+      if (Math.random() < this.bossEnvHeat * 0.15) {
+        this.bossCatSweat.push({
+          x: this.cat.x + (Math.random() - 0.5) * 30,
+          y: this.cat.y - 50 - Math.random() * 20,
+          vy: 50 + Math.random() * 40,
+          life: 0, maxLife: 0.8 + Math.random() * 0.4,
+        });
+      }
+    }
+    for (const d of this.bossCatSweat) {
+      d.life += dt; d.y += d.vy * dt; d.vy += 150 * dt;
+    }
+    this.bossCatSweat = this.bossCatSweat.filter(d => d.life < d.maxLife);
+
+    // P2 黑煙粒子（持續從魔王位置湧出，直到風吹散）
+    if (this.bossPhase === 2 && this.bossSmokeAlpha > 0.1 && this.p2Step === 2) {
+      if (Math.random() < 0.6) {
+        this.bossSmokePuffs.push({
+          x: this.bossX + (Math.random() - 0.5) * 80,
+          y: this.bossY + (Math.random() - 0.5) * 40,
+          vx: (Math.random() - 0.5) * 20,
+          vy: -15 - Math.random() * 20,
+          life: 0, maxLife: 2.0 + Math.random() * 1.5,
+          size: 25 + Math.random() * 35,
+        });
+      }
+    }
+    for (const p of this.bossSmokePuffs) {
+      p.life += dt;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vy *= 0.985;
+      p.size += dt * 10;
+    }
+    this.bossSmokePuffs = this.bossSmokePuffs.filter(p => p.life < p.maxLife);
+
+    // P3：溫度控制（魔王體溫會自動往上飆升！不操作會持續過熱）
     if (this.bossPhase === 3 && !this.bossDying) {
       if (this.heating) this.bossHeat = Math.min(100, this.bossHeat + 30 * dt);
       else if (this.cooling) this.bossHeat = Math.max(0, this.bossHeat - 30 * dt);
-      else this.bossHeat += (60 - this.bossHeat) * dt * 0.4;
+      else this.bossHeat += (85 - this.bossHeat) * dt * 0.5; // 不操作 → 飆到 85（過熱區）
 
       // 在綠區（40~60）累積冷卻進度
       if (this.bossHeat >= 40 && this.bossHeat <= 60) {
@@ -3255,9 +3909,95 @@ class FireBossScene extends FireLevelBase {
     const W = Game.width, H = Game.height;
     this.drawBackground(ctx);
 
-    // 魔王
+    // 🔥 P2 熱氣粒子（從地面冒）
+    if (this.bossHeatHaze.length > 0) {
+      for (const h of this.bossHeatHaze) {
+        const fade = 1 - h.life / h.maxLife;
+        const a = fade * 0.45 * Math.min(1, this.bossEnvHeat);
+        const grad = ctx.createRadialGradient(h.x, h.y, 0, h.x, h.y, h.size);
+        grad.addColorStop(0, `hsla(${h.hue}, 90%, 55%, ${a})`);
+        grad.addColorStop(1, `hsla(${h.hue}, 90%, 50%, 0)`);
+        ctx.fillStyle = grad;
+        ctx.beginPath(); ctx.arc(h.x, h.y, h.size, 0, Math.PI*2); ctx.fill();
+      }
+    }
+
+    // 🌫️ P2 熱浪紅色遮罩
+    if (this.bossEnvHeat > 0.3) {
+      const heatA = Math.min(0.35, (this.bossEnvHeat - 0.3) * 0.4);
+      const gradH = ctx.createLinearGradient(0, 0, 0, H);
+      gradH.addColorStop(0, `rgba(255, 80, 20, ${heatA * 0.7})`);
+      gradH.addColorStop(0.5, `rgba(255, 120, 40, ${heatA})`);
+      gradH.addColorStop(1, `rgba(255, 60, 10, ${heatA * 1.2})`);
+      ctx.fillStyle = gradH;
+      ctx.fillRect(0, 0, W, H);
+    }
+
+    // 魔王（被黑煙遮住時降低透明度，幾乎看不到）
     if (!this.bossDying || this.time - this.bossDieTime < 2) {
+      const bossAlpha = Math.max(0.05, 1 - this.bossSmokeAlpha * 0.95);
+      ctx.save();
+      ctx.globalAlpha = bossAlpha;
       this.drawBoss(ctx);
+      ctx.restore();
+    }
+
+    // 🎬 P2 特效：冰塊掉落 + 冷霧 + 濃濃黑煙完全遮住魔王
+    if (this.bossFrostMist.length > 0) {
+      for (const m of this.bossFrostMist) {
+        const fade = 1 - m.life / m.maxLife;
+        const a = fade * 0.7;
+        const grad = ctx.createRadialGradient(m.x, m.y, 0, m.x, m.y, m.size);
+        grad.addColorStop(0, `rgba(225, 245, 254, ${a})`);
+        grad.addColorStop(0.5, `rgba(129, 212, 250, ${a * 0.5})`);
+        grad.addColorStop(1, 'rgba(79, 195, 247, 0)');
+        ctx.fillStyle = grad;
+        ctx.beginPath(); ctx.arc(m.x, m.y, m.size, 0, Math.PI*2); ctx.fill();
+      }
+    }
+    if (this.bossIceBlock) {
+      const ib = this.bossIceBlock;
+      if (ib.size > 0) {
+        const sz = ib.size;
+        ctx.save();
+        ctx.translate(ib.x, ib.y);
+        const grad = ctx.createLinearGradient(-sz, -sz, sz, sz);
+        grad.addColorStop(0, '#ffffff');
+        grad.addColorStop(0.4, '#bbdefb');
+        grad.addColorStop(1, '#4fc3f7');
+        ctx.fillStyle = grad;
+        ctx.fillRect(-sz, -sz, sz*2, sz*2);
+        ctx.strokeStyle = '#0277bd'; ctx.lineWidth = 2;
+        ctx.strokeRect(-sz, -sz, sz*2, sz*2);
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+        ctx.fillRect(-sz + 4, -sz + 4, sz * 0.5, sz * 0.3);
+        ctx.restore();
+      }
+    }
+    // 濃濃黑煙團（蓋在魔王上方，遮住他！）
+    if (this.bossSmokePuffs.length > 0) {
+      for (const p of this.bossSmokePuffs) {
+        const fade = 1 - p.life / p.maxLife;
+        const a = fade * 0.85 * Math.min(1, this.bossSmokeAlpha * 1.5);
+        const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.size);
+        grad.addColorStop(0, `rgba(40, 40, 40, ${a})`);
+        grad.addColorStop(0.5, `rgba(20, 20, 20, ${a * 0.7})`);
+        grad.addColorStop(1, 'rgba(20, 20, 20, 0)');
+        ctx.fillStyle = grad;
+        ctx.beginPath(); ctx.arc(p.x, p.y, p.size, 0, Math.PI*2); ctx.fill();
+      }
+      // 「找不到魔王」文字提示
+      if (this.bossSmokeAlpha > 0.5 && this.p2Step === 2) {
+        ctx.save();
+        ctx.fillStyle = `rgba(255, 215, 0, ${this.bossSmokeAlpha})`;
+        ctx.font = 'bold 18px -apple-system, "PingFang TC"';
+        ctx.textAlign = 'center';
+        ctx.fillText('❓ 黑煙太濃，看不到魔王了！', W/2, this.bossY - 100);
+        ctx.fillStyle = `rgba(255, 255, 255, ${this.bossSmokeAlpha * 0.8})`;
+        ctx.font = '14px -apple-system, "PingFang TC"';
+        ctx.fillText('用 🌬️ 風吹散黑煙才能攻擊', W/2, this.bossY - 78);
+        ctx.restore();
+      }
     }
 
     // boss 火球攻擊
@@ -3304,6 +4044,28 @@ class FireBossScene extends FireLevelBase {
     }
 
     if (this.cat) this.cat.draw(ctx);
+
+    // 💦 BOSS P2 貓咪汗珠
+    if (this.bossCatSweat.length > 0) {
+      for (const d of this.bossCatSweat) {
+        const fade = 1 - d.life / d.maxLife;
+        ctx.fillStyle = `rgba(120, 200, 255, ${fade * 0.9})`;
+        ctx.beginPath();
+        ctx.ellipse(d.x, d.y, 3, 5, 0, 0, Math.PI*2);
+        ctx.fill();
+        ctx.strokeStyle = `rgba(80, 140, 200, ${fade})`;
+        ctx.lineWidth = 0.8;
+        ctx.stroke();
+      }
+    }
+    // 🥵 BOSS P2 貓咪表情
+    if (this.cat && this.bossEnvHeat > 0.6 && this.bossPhase === 2 && this.p2Step === 1) {
+      const fy = this.cat.y - 75 + Math.sin(this.time * 3) * 2;
+      ctx.font = '20px -apple-system';
+      ctx.textAlign = 'center';
+      ctx.fillText('🥵', this.cat.x + 30, fy);
+    }
+
     this.drawForeground(ctx);
 
     // 階段對應 UI
@@ -3423,7 +4185,7 @@ class FireBossScene extends FireLevelBase {
     ctx.fillStyle = this.p2Step === 1 ? '#4fc3f7' : '#81c784';
     ctx.font = 'bold 13px -apple-system, "PingFang TC"';
     ctx.textAlign = 'center';
-    ctx.fillText(`步驟 ${this.p2Step}/2：` + (this.p2Step === 1 ? '先讓火變弱' : '把殘火吹熄'), W/2, 145);
+    ctx.fillText(`步驟 ${this.p2Step}/2：` + (this.p2Step === 1 ? '先讓火盾失效' : '吹散黑煙找出魔王'), W/2, 145);
   }
   drawP3UI(ctx) {
     const W = Game.width, H = Game.height;
@@ -3469,8 +4231,8 @@ class FireBossScene extends FireLevelBase {
     // 按鈕
     const btnY = H - 80;
     [
-      { x: W*0.35, label: '🔥 加熱', color: '#ff5722', active: this.heating },
-      { x: W*0.65, label: '❄️ 降溫', color: '#03a9f4', active: this.cooling },
+      { x: W*0.42, label: '🔥 加熱', color: '#ff5722', active: this.heating },
+      { x: W*0.58, label: '❄️ 降溫', color: '#03a9f4', active: this.cooling },
     ].forEach(btn => {
       ctx.fillStyle = btn.active ? btn.color : 'rgba(255,255,255,0.15)';
       ctx.beginPath(); ctx.arc(btn.x, btnY, 42, 0, Math.PI*2); ctx.fill();
@@ -4740,6 +5502,7 @@ class IceLevel1Scene extends FireLevelBase {
     for (const c of this.clues) {
       const dx = x - c.x, dy = y - c.y;
       if (dx*dx + dy*dy < 50*50) {
+        if (!c.revealed) Sound.pop();
         c.revealed = true;
         return;
       }
